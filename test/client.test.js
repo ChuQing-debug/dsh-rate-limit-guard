@@ -142,5 +142,16 @@ test('saving rejects invalid reference names and writes the new fields otherwise
   await saveButton.props.onClick()
   assert.equal(good.mutations.length, 1)
   const paths = good.mutations[0].map((op) => op.path[0])
-  for (const field of ['jitter', 'waitOnQuota', 'quotaCooldownMinutes', 'keepOriginalKey']) assert.ok(paths.includes(field), field)
+  for (const field of ['jitter', 'waitOnQuota', 'quotaCooldownMinutes', 'keepOriginalKey', 'maxTotalWaitMinutes', 'language']) assert.ok(paths.includes(field), field)
+})
+
+test('saving accepts "provider=-" as a no-rotation mapping', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY', providerRefs: ['lan-qwen=-', 'intern=INTERN_API_KEY'] })
+  const tree = await b.render(b.section.Component, b.section.entry.inject())
+  let saveButton
+  walk(tree, (n) => { if (n.type === 'button' && n.children.includes('save')) saveButton = n })
+  await saveButton.props.onClick()
+  assert.equal(b.mutations.length, 1)
+  assert.ok(texts(tree).includes('INTERN_API_KEY'))
+  assert.ok(!texts(tree).includes('-'))
 })

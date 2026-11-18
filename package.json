@@ -1,8 +1,15 @@
 {
   "name": "dsh-rate-limit-guard",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Wait out provider rate limits or rotate to another API key, with a settings UI and an event log.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChuQing-debug/dsh-rate-limit-guard.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "main": "index.js",
   "scripts": {

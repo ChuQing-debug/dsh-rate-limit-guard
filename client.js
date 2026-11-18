@@ -50,6 +50,11 @@ window.__ModuleLoader__.load({
         waitOnQuotaHint: '默认关闭：QUOTA / ACCOUNT_QUOTA 表示余额或额度用完，等待无法恢复，会直接交回默认处理。',
         maxAttempts: '每步骤最多重试次数',
         maxAttemptsHint: '达到上限后交回默认重试策略，避免无限等待。',
+        maxTotalWaitMinutes: '每步骤累计等待上限（分钟）',
+        maxTotalWaitMinutesHint: '同一步骤的等待时间加起来超过这个值就不再等待，交回默认处理。0 表示不限制。',
+        language: '日志与 /ratelimit-log 的语言',
+        languageHint: '“跟随系统”按运行 DSH 的系统语言选择中文或英文。',
+        languageAuto: '跟随系统',
         keysTitle: '密钥池',
         keysDesc: '密钥值只写入凭据服务，本页保存的是引用名称。轮换会把备用密钥的值写入目标引用，下一个请求立即生效。',
         credentialRef: '目标密钥引用',
@@ -57,12 +62,12 @@ window.__ModuleLoader__.load({
         alternates: '备用密钥引用',
         alternatesHint: '每行一个。按顺序轮流使用，跳过正在冷却（刚被限流）的密钥。',
         keepOriginalKey: '轮换前备份原密钥',
-        keepOriginalKeyHint: '第一次换走不在池中的密钥时，把它保存到 <目标引用>_RLG_ORIGINAL，并让它参与后续轮换，原密钥不会丢失。',
+        keepOriginalKeyHint: '第一次换走不在池中的密钥时，把它保存到 <目标引用>_RLG_ORIGINAL，并让它参与后续轮换；之后再出现的未知密钥保存到 <目标引用>_RLG_PREVIOUS。两个备份都不会被覆盖，都占用时不再轮换、改为等待，需要你清理其中一个或把新密钥加入密钥池。',
         quotaCooldownMinutes: '额度耗尽的密钥冷却（分钟）',
         quotaCooldownMinutesHint: 'QUOTA / ACCOUNT_QUOTA 的密钥在这段时间内不会再被选中。',
         invalidRefs: '引用名称只能包含字母、数字和下划线，且不能以数字开头',
         providerRefs: '按提供方映射（provider=引用）',
-        providerRefsHint: '可选，每行一条，例如 deepseek-api-key=DEEPSEEK_API_KEY。未匹配的提供方使用目标密钥引用。',
+        providerRefsHint: '可选，每行一条，例如 deepseek-api-key=DEEPSEEK_API_KEY。未匹配的提供方使用目标密钥引用。不读取 API Key 的提供方（本地模型、固定请求头等）请写成 提供方=-，对它只等待不轮换。',
         fallbackToWait: '没有可用备用密钥时改为等待',
         fallbackToWaitHint: '关闭后会把限流错误交回后续处理器，不再等待。',
         keysEmpty: '先在“目标密钥引用”里填写引用名称，再保存。',
@@ -115,6 +120,11 @@ window.__ModuleLoader__.load({
         waitOnQuotaHint: 'Off by default: QUOTA / ACCOUNT_QUOTA means the balance or quota is used up, so waiting cannot help and the failure is handed back.',
         maxAttempts: 'Retries per step',
         maxAttemptsHint: 'After this cap the ordinary retry policy takes over.',
+        maxTotalWaitMinutes: 'Total wait per step (minutes)',
+        maxTotalWaitMinutesHint: 'Once the waits of one step add up to more than this, the guard stops waiting and hands the failure back. 0 means no limit.',
+        language: 'Language of the log and /ratelimit-log',
+        languageHint: '"Follow system" picks Chinese or English from the locale of the machine running DSH.',
+        languageAuto: 'Follow system',
         keysTitle: 'Key pool',
         keysDesc: 'Key values go to the credentials service only; this page stores reference names. Rotation writes a pool value into the target reference and the next request uses it.',
         credentialRef: 'Target credential reference',
@@ -122,12 +132,12 @@ window.__ModuleLoader__.load({
         alternates: 'Pool references',
         alternatesHint: 'One per line. Keys are used in turn; keys still cooling down after a limit are skipped.',
         keepOriginalKey: 'Back up the original key before rotating',
-        keepOriginalKeyHint: 'The first time a key outside the pool is rotated away, it is saved to <target>_RLG_ORIGINAL and joins the rotation, so it is never lost.',
+        keepOriginalKeyHint: 'The first time a key outside the pool is rotated away, it is saved to <target>_RLG_ORIGINAL and joins the rotation; a later unknown key goes to <target>_RLG_PREVIOUS. Neither backup is ever overwritten: when both are taken the guard stops rotating and waits, until you clear one or add the new key to the pool.',
         quotaCooldownMinutes: 'Cooldown for exhausted keys (minutes)',
         quotaCooldownMinutesHint: 'A key that returned QUOTA / ACCOUNT_QUOTA is not picked again for this long.',
         invalidRefs: 'Reference names may only contain letters, digits and underscores, and must not start with a digit',
         providerRefs: 'Provider mapping (provider=ref)',
-        providerRefsHint: 'Optional, one per line, e.g. deepseek-api-key=DEEPSEEK_API_KEY. Unmatched providers use the target reference.',
+        providerRefsHint: 'Optional, one per line, e.g. deepseek-api-key=DEEPSEEK_API_KEY. Unmatched providers use the target reference. For a provider that reads no API key (local models, fixed headers) write provider=- so it only waits and is never rotated.',
         fallbackToWait: 'Wait when no pool key is usable',
         fallbackToWaitHint: 'Turn this off to hand the failure back to later handlers instead of waiting.',
         keysEmpty: 'Enter a target credential reference first.',
@@ -220,11 +230,14 @@ window.__ModuleLoader__.load({
 
     const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+    const isNoRotate = (ref) => ref === '' || ref === '-'
+
     function invalidRefsOf(draft) {
       const refs = [String(draft.credentialRef ?? '').trim(), ...splitList(draft.alternateKeyRefs)]
       for (const mapping of splitList(draft.providerRefs)) {
         const separator = mapping.indexOf('=')
-        refs.push(separator > 0 ? mapping.slice(separator + 1).trim() : mapping)
+        if (separator <= 0) refs.push(mapping)
+        else if (!isNoRotate(mapping.slice(separator + 1).trim())) refs.push(mapping.slice(separator + 1).trim())
       }
       return refs.filter((ref) => ref !== '' && !REF_PATTERN.test(ref))
     }
@@ -235,15 +248,25 @@ window.__ModuleLoader__.load({
       const push = (ref) => {
         if (typeof ref === 'string' && ref.trim() !== '' && !out.includes(ref.trim())) out.push(ref.trim())
       }
-      push(value.credentialRef)
-      if (value.keepOriginalKey && typeof value.credentialRef === 'string' && value.credentialRef.trim() !== '') {
-        push(`${value.credentialRef.trim()}_RLG_ORIGINAL`)
+      // every target (default + mapped) with its two backup slots, then the alternates
+      const targets = []
+      const target = (ref) => {
+        const name = typeof ref === 'string' ? ref.trim() : ''
+        if (name !== '' && !targets.includes(name)) targets.push(name)
       }
-      for (const ref of splitList(value.alternateKeyRefs)) push(ref)
+      target(value.credentialRef)
       for (const mapping of splitList(value.providerRefs)) {
         const separator = mapping.indexOf('=')
-        if (separator > 0) push(mapping.slice(separator + 1))
+        if (separator > 0 && !isNoRotate(mapping.slice(separator + 1).trim())) target(mapping.slice(separator + 1))
       }
+      for (const name of targets) {
+        push(name)
+        if (value.keepOriginalKey) {
+          push(`${name}_RLG_ORIGINAL`)
+          push(`${name}_RLG_PREVIOUS`)
+        }
+      }
+      for (const ref of splitList(value.alternateKeyRefs)) push(ref)
       return out
     }
 
@@ -255,6 +278,8 @@ window.__ModuleLoader__.load({
         useRetryAfter: v.useRetryAfter !== false,
         maxWaitSeconds: String(v.maxWaitSeconds ?? 900),
         maxAttempts: String(v.maxAttempts ?? 12),
+        maxTotalWaitMinutes: String(v.maxTotalWaitMinutes ?? 60),
+        language: v.language === 'zh' || v.language === 'en' ? v.language : 'auto',
         credentialRef: String(v.credentialRef ?? 'DEEPSEEK_API_KEY'),
         alternateKeyRefs: Array.isArray(v.alternateKeyRefs) ? v.alternateKeyRefs.join('\n') : '',
         providerRefs: Array.isArray(v.providerRefs) ? v.providerRefs.join('\n') : '',
@@ -268,9 +293,13 @@ window.__ModuleLoader__.load({
     }
 
     function numberOr(value, fallback, min, max) {
+      // A blank field means "use the default", not 0 (0 switches some limits off).
+      if (String(value ?? '').trim() === '') return fallback
       const parsed = Number(value)
       if (!Number.isFinite(parsed)) return fallback
-      return Math.min(Math.max(Math.round(parsed), min), max)
+      // Never round a small positive value down to 0: 0 means "no limit" for some fields.
+      const rounded = parsed > 0 ? Math.max(1, Math.round(parsed)) : Math.round(parsed)
+      return Math.min(Math.max(rounded, min), max)
     }
 
     function buildOps(draft) {
@@ -280,6 +309,8 @@ window.__ModuleLoader__.load({
         { op: 'set', path: ['useRetryAfter'], value: draft.useRetryAfter === true },
         { op: 'set', path: ['maxWaitSeconds'], value: numberOr(draft.maxWaitSeconds, 900, 1, 86400) },
         { op: 'set', path: ['maxAttempts'], value: numberOr(draft.maxAttempts, 12, 1, 100) },
+        { op: 'set', path: ['maxTotalWaitMinutes'], value: numberOr(draft.maxTotalWaitMinutes, 60, 0, 10080) },
+        { op: 'set', path: ['language'], value: draft.language },
         { op: 'set', path: ['credentialRef'], value: String(draft.credentialRef ?? '').trim() || 'DEEPSEEK_API_KEY' },
         { op: 'set', path: ['alternateKeyRefs'], value: splitList(draft.alternateKeyRefs) },
         { op: 'set', path: ['providerRefs'], value: splitList(draft.providerRefs) },
@@ -588,6 +619,17 @@ window.__ModuleLoader__.load({
 
         h(Card, { title: t('advancedTitle'), desc: t('advancedDesc') },
           h(Row, { label: t('maxAttempts'), hint: t('maxAttemptsHint') }, numberInput('maxAttempts', 1, 100)),
+          h(Row, { label: t('maxTotalWaitMinutes'), hint: t('maxTotalWaitMinutesHint') }, numberInput('maxTotalWaitMinutes', 0, 10080)),
+          h(Row, { label: t('language'), hint: t('languageHint') },
+            h('select', {
+              className: 'rlg-input',
+              value: draft.language,
+              disabled: !writable,
+              onChange: (event) => update({ language: event.target.value }),
+            },
+              h('option', { value: 'auto' }, t('languageAuto')),
+              h('option', { value: 'zh' }, '中文'),
+              h('option', { value: 'en' }, 'English'))),
           h(Row, { label: t('guardedProviders'), hint: t('guardedProvidersHint') },
             h('textarea', {
               className: 'rlg-textarea',
