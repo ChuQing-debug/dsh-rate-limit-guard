@@ -36,7 +36,8 @@
     "README.en.md",
     "LICENSE",
     "SECURITY.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "CHANGELOG.en.md"
   ],
   "dsh": {
     "bundle": {
