@@ -74,6 +74,7 @@ function boot(settingsValue, { writable = true } = {}) {
   })
   let dict
   let section
+  let dock
   const mutations = []
   const ctx = {
     effect: (fn) => fn(),
@@ -84,6 +85,14 @@ function boot(settingsValue, { writable = true } = {}) {
     slots: {
       inject: (_name, fn) => fn(),
       register: (entry, Component) => { section = { entry, Component } },
+    },
+    inject: (_deps, cb) => {
+      cb({
+        slots: {
+          inject: (_name, fn) => fn(),
+          register: (entry, Component) => { dock = { entry, Component } },
+        },
+      })
     },
     remote: {
       settings: {
@@ -97,7 +106,7 @@ function boot(settingsValue, { writable = true } = {}) {
     },
   }
   factory.apply(ctx)
-  return { dict, section, render, mutations }
+  return { dict, section, dock, render, mutations }
 }
 
 function walk(node, visit) {
@@ -154,4 +163,51 @@ test('saving accepts "provider=-" as a no-rotation mapping', async () => {
   assert.equal(b.mutations.length, 1)
   assert.ok(texts(tree).includes('INTERN_API_KEY'))
   assert.ok(!texts(tree).includes('-'))
+})
+
+function fakeEventSource() {
+  const listeners = new Set()
+  let snapshot = { change: null }
+  return {
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) },
+    getSnapshot() { return snapshot },
+    push(event) {
+      snapshot = { change: { kind: 'append', entries: [{ event }] } }
+      for (const fn of [...listeners]) fn()
+    },
+  }
+}
+
+test('truncation banner offers manual continue when unattended is off', async () => {
+  const b = boot({ unattended: false, continueText: '继续' })
+  assert.equal(b.dock.entry.name, 'conversation.input.dock')
+  assert.equal(b.dock.entry.id, 'rate-limit-guard-truncation')
+  const eventSource = fakeEventSource()
+  const input = { setDraft: () => {}, focus() {} }
+  const api = { read: async () => ({ view: { value: { unattended: false, continueText: '继续' } }, writable: true }) }
+  const props = { api, t: (key) => key, binding: { eventSource }, input }
+  let tree = await b.render(b.dock.Component, props)
+  assert.equal(tree, null)
+  eventSource.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'max-tokens' } } })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  tree = await b.render(b.dock.Component, props)
+  let fill
+  walk(tree, (n) => { if (n.type === 'button' && n.children.includes('bannerFill')) fill = n })
+  assert.ok(fill, 'fill button rendered')
+  let drafted
+  input.setDraft = (text) => { drafted = text }
+  fill.props.onClick()
+  assert.equal(drafted, '继续')
+})
+
+test('truncation banner stays hidden in unattended mode', async () => {
+  const b = boot({ unattended: true })
+  const eventSource = fakeEventSource()
+  const api = { read: async () => ({ view: { value: { unattended: true } }, writable: true }) }
+  const props = { api, t: (key) => key, binding: { eventSource }, input: { setDraft() {}, focus() {} } }
+  await b.render(b.dock.Component, props)
+  eventSource.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'max-tokens' } } })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  const tree = await b.render(b.dock.Component, props)
+  assert.equal(tree, null)
 })

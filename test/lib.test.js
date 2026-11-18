@@ -138,7 +138,7 @@ test('parseRetryHint: second review round', () => {
 })
 
 test('parseRetryHint reads gateway "holding until <time> (~9s)" messages', () => {
-  const real = '429: {"type":"rate_limit_error","code":"bili_throttle_hold","stage":"forward","message":"upstream rate-limited 1 consecutive request(s) to discovery-api.intern-ai.org.cn; bili is holding outbound sends until 2026-11-18T11:11:52.150Z (~9s, exponential backoff) instead of amplifying — zero egress while held, auto-resumes when the limit clears (#4204)","retryable":true}'
+  const real = '429: {"type":"rate_limit_error","code":"gateway_throttle_hold","stage":"forward","message":"upstream rate-limited 1 consecutive request(s) to api.example.com; gateway is holding outbound sends until 2026-11-18T11:11:52.150Z (~9s, exponential backoff) instead of amplifying — zero egress while held, auto-resumes when the limit clears (#4204)","retryable":true}'
   assert.equal(parseRetryHint(real), 9000)
   // without the relative part, the timestamp is used against the given clock
   const now = Date.parse('2026-11-18T11:11:40.000Z')

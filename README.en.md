@@ -1,7 +1,7 @@
 # dsh-rate-limit-guard
 
 [![test](https://github.com/ChuQing-debug/dsh-rate-limit-guard/actions/workflows/test.yml/badge.svg)](https://github.com/ChuQing-debug/dsh-rate-limit-guard/actions/workflows/test.yml)
-![version](https://img.shields.io/badge/version-0.3.0-blue)
+![version](https://img.shields.io/badge/version-0.3.1-blue)
 ![DSH](https://img.shields.io/badge/DSH-0.2.2--rc.3-6f42c1)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -19,20 +19,23 @@ When an agent hits a rate limit mid-task, DSH retries a few times and then fails
 
 - **Wait mode** (default): waits for as long as the provider says, or for the time you configured, then retries the same step.
 - **Rotate mode**: with several keys, switches to the next one and retries at once; when every key is limited, waits for the first one to come back.
-- Exhausted balance or quota (402) is not waited out: rotate mode switches keys, wait mode fails straight away.
+- Exhausted balance or quota (`QUOTA` / `ACCOUNT_QUOTA`) is not waited out: rotate mode switches keys, wait mode fails straight away.
+- **Unattended continuation**: when the model stops at its output token limit, the plugin can send the continue message for you; with it off, a small prompt above the composer offers to fill the message in.
 - Every wait and rotation is recorded; type `/ratelimit-log` in a conversation to see them.
 
 ## Quick start
 
 ### Install
 
-1. Clone the repository to a permanent location. DSH links to this directory, so do not move or delete it afterwards.
+Requires DSH 0.2.2-rc.3 or a compatible release (verified on desktop). No runtime dependencies and no build step.
+
+1. Clone the repository to a permanent location. DSH usually links to this directory, so do not move or delete it afterwards; even when your setup copies instead of links, keep the clone around for updates.
 
    ```bash
    git clone https://github.com/ChuQing-debug/dsh-rate-limit-guard.git
    ```
 
-2. In DSH open **Plugin Manager → Install bundle** and choose the cloned directory. From the command line:
+2. In DSH open **Plugin Manager → Install bundle** and choose the cloned directory. From the command line, if your DSH install ships the CLI:
 
    ```bash
    dsh plugin --profile <profile name> add <absolute path of the clone>
@@ -126,6 +129,17 @@ Every option except `minWaitSeconds` can be changed on the settings page and tak
 
 Reference names may contain letters, digits and underscores, and must not start with a digit.
 
+### Unattended mode
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `unattended` | `false` | Send the continue message automatically when the reply is cut off by the output token limit |
+| `continueText` | `继续` | The message that is sent |
+
+When a turn ends at the output token cap (`turn/end` with `reason.kind` `max-tokens`), the plugin sends `continueText` to the same session so the model carries on. At most 20 consecutive auto-continues are allowed; any turn that does not end in a truncation, or a gap of 30 minutes, resets the counter, and the cap is logged once.
+
+With the switch off, DSH's own "output token limit reached" notice still appears, and a small bar above the composer offers **Fill continue**, which puts `continueText` in the input and focuses it; the bar can also be dismissed.
+
 ## Key safety
 
 Rotation rewrites the key in the target reference, so the plugin follows one rule: **it never overwrites a key that is not stored somewhere else.**
@@ -146,7 +160,7 @@ With `keepOriginalKey` off there is no backup and rotation overwrites the target
 - **No switching between providers.** A DSH retry reuses the step's provider and model; the plugin changes the key that provider reads.
 - **Keyless providers must be marked by hand.** DSH does not tell plugins which reference a provider reads, so only `deepseek-account` is recognised automatically; others need `provider=-` in the mapping.
 - **`Retry-After` headers may not arrive.** On DSH 0.2.2-rc.3 the header of an `openai-completions` provider did not reach the plugin, leaving only hints in the error message, or the default wait.
-- **No rotation in headless mode by default.** The `headless` profile ships without the credentials service, so rotation falls back to waiting. Enable `credentials` in the profile to use it.
+- **No rotation without the credentials service.** A profile that does not load `credentials` cannot read or replace keys, so rotation falls back to waiting and logs the reason.
 - **No live status on the settings page.** DSH does not let a third-party plugin feed runtime state to its own settings page; use `/ratelimit-log`.
 - **Rotation is global.** The target reference is shared by every session that reads it.
 - **Cooldowns are per key, not per model.** A key limited on one model is skipped for other models too, for a while.
@@ -181,3 +195,5 @@ npm test        # all tests, on node:test, no dependencies
 ## License
 
 [MIT](LICENSE). `schemastery` and `cosmokit` under `vendor/` are MIT licensed as well; see [vendor/NOTICE.md](vendor/NOTICE.md).
+
+For security issues, please do not open a public issue; report them privately as described in [SECURITY.md](SECURITY.md).

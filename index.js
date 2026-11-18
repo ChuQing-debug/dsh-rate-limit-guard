@@ -50,6 +50,10 @@ const REJECTED_KEY_COOLDOWN_MS = 60 * 60 * 1000
  */
 const MAX_REJECTS_PER_WINDOW = 2
 const REJECT_LIMIT_WINDOW_MS = 10 * 60 * 1000
+/** Consecutive automatic "continue" prompts per session before the guard stops and asks for a human. */
+const MAX_AUTO_CONTINUES = 20
+/** A gap longer than this between two truncations resets the consecutive counter. */
+const AUTO_CONTINUE_RESET_MS = 30 * 60 * 1000
 
 export const Config = z.object({
   mode: z.union(['wait', 'rotate']).default('wait').volatile(),
@@ -69,6 +73,8 @@ export const Config = z.object({
   keepOriginalKey: z.boolean().default(true).volatile(),
   fallbackToWait: z.boolean().default(true).volatile(),
   guardedProviders: z.array(z.string()).default([]).volatile(),
+  unattended: z.boolean().default(false).volatile(),
+  continueText: z.string().default('继续').volatile(),
 })
 
 function messageOf(error) {
@@ -114,6 +120,12 @@ function readStrings(value) {
     out.push(trimmed)
   }
   return out
+}
+
+/** The text an unattended turn sends after the model hits its output cap. */
+function readContinueText(value) {
+  const text = String(readField(value, '继续')).trim()
+  return text === '' ? '继续' : text.slice(0, 200)
 }
 
 function truncate(text, max) {
@@ -199,6 +211,8 @@ const ACTION_LABELS = {
     'original-saved': '已备份原密钥',
     'quota-handoff': '额度耗尽，交回处理',
     exhausted: '达到上限',
+    'auto-continue': '自动继续',
+    'auto-continue-capped': '连续自动继续已停止',
   },
   en: {
     detected: 'Rate limit detected',
@@ -212,6 +226,8 @@ const ACTION_LABELS = {
     'original-saved': 'Original key backed up',
     'quota-handoff': 'Quota exhausted, handed back',
     exhausted: 'Limit reached',
+    'auto-continue': 'Auto-continued',
+    'auto-continue-capped': 'Auto-continue stopped',
   },
 }
 
@@ -226,6 +242,8 @@ function systemLanguage() {
 
 export function apply(ctx, config = {}) {
   const attempts = new Map()
+  /** session id -> { count, lastAt, capped } of consecutive auto-continues after a truncation */
+  const autoContinues = new Map()
   const logs = []
   const lifetime = new AbortController()
   /** fingerprint -> epoch ms until which that key is known to be limited / exhausted */
@@ -283,6 +301,8 @@ export function apply(ctx, config = {}) {
       keepOriginalKey: readBoolean(config.keepOriginalKey, true),
       fallbackToWait: readBoolean(config.fallbackToWait, true),
       guardedProviders: readStrings(config.guardedProviders),
+      unattended: readBoolean(config.unattended, false),
+      continueText: readContinueText(config.continueText),
     }
   }
 
@@ -400,6 +420,9 @@ export function apply(ctx, config = {}) {
         `wait (default ${cfg.waitSeconds}s, at most ${cfg.maxWaitSeconds}s each)`,
       )
     const lines = [L(`限流守护 · 当前模式：${modeText}`, `Rate limit guard · mode: ${modeText}`)]
+    lines.push(cfg.unattended
+      ? L(`无人值守：开启（输出被截断时自动发送“${truncate(cfg.continueText, 20)}”）`, `Unattended: on (sends "${truncate(cfg.continueText, 20)}" when output is cut off)`)
+      : L('无人值守：关闭（输出被截断时由对话中的提示条提示手动继续）', 'Unattended: off (a prompt above the composer asks you to continue)'))
     if (cfg.mode === 'rotate') {
       lines.push(L('密钥状态：', 'Key status:'))
       try {
@@ -961,6 +984,79 @@ export function apply(ctx, config = {}) {
       lastRotation.clear()
     }
   }, 'rate-limit-guard: request-error listener')
+
+  /**
+   * Unattended mode. A turn whose output hits the model's token cap ends with
+   * `turn/end` reason `max-tokens`; a followup user message lets the model write on from where it
+   * stopped. The platform notice does this manually, this listener does it for the user.
+   */
+  ctx.effect(() => {
+    const off = ctx.on('session/event', (session, event) => {
+      try {
+        if (event?.type !== 'turn/end') return
+        const reason = event.data?.reason
+        if (reason?.kind !== 'max-tokens') {
+          autoContinues.delete(session?.id)
+          return
+        }
+        const cfg = readConfig()
+        if (!cfg.unattended) return
+        const sessionId = session?.id
+        if (sessionId === undefined) return
+        const now = Date.now()
+        const previous = autoContinues.get(sessionId)
+        const count = previous && now - previous.lastAt < AUTO_CONTINUE_RESET_MS ? previous.count : 0
+        if (count >= MAX_AUTO_CONTINUES) {
+          if (!previous?.capped) {
+            record('warn', {
+              action: 'auto-continue-capped',
+              retry: count,
+              note: L(`连续自动继续 ${count} 次后输出仍被截断，已停止，请手动检查。`, `stopped after ${count} automatic continues; please check the session manually`),
+            })
+          }
+          autoContinues.set(sessionId, { count, lastAt: now, capped: true })
+          return
+        }
+        autoContinues.set(sessionId, { count: count + 1, lastAt: now, capped: false })
+        // Wait for the turn to finish settling before waking the agent again.
+        setTimeout(() => {
+          if (lifetime.signal.aborted) return
+          const agent = ctx.agents.get(sessionId)
+          if (!agent) {
+            record('warn', {
+              action: 'auto-continue',
+              note: L('会话已关闭，未发送“继续”', 'the session closed before "continue" could be sent'),
+            })
+            return
+          }
+          try {
+            agent.followup({
+              id: randomUUID(),
+              role: 'user',
+              content: [{ type: 'text', text: cfg.continueText }],
+              source: { kind: 'user' },
+            })
+            record('info', {
+              action: 'auto-continue',
+              retry: count + 1,
+              note: L(`输出被 token 上限截断，已自动发送“${truncate(cfg.continueText, 30)}”`, `output was cut off at the token limit; sent "${truncate(cfg.continueText, 30)}" automatically`),
+            })
+          } catch (error) {
+            record('warn', {
+              action: 'auto-continue',
+              note: L(`自动继续失败：${messageOf(error)}`, `could not auto-continue: ${messageOf(error)}`),
+            })
+          }
+        }, 0)
+      } catch (error) {
+        ctx.logger?.warn?.(`rate-limit-guard: auto-continue handler failed: ${messageOf(error)}`)
+      }
+    })
+    return () => {
+      off()
+      autoContinues.clear()
+    }
+  }, 'rate-limit-guard: unattended auto-continue')
 
   ctx.inject(['commands'], (sub) => {
     sub.commands.register({

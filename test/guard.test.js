@@ -9,6 +9,8 @@ function harness(config = {}, initial = {}) {
   const events = []
   const disposers = []
   let listener
+  let sessionListener
+  let agentRef
   let command
   const credentials = {
     async resolve(ref) {
@@ -28,23 +30,33 @@ function harness(config = {}, initial = {}) {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
     inject(_deps, cb) { cb(sub) },
     effect(fn) { const d = fn(); if (d) disposers.push(d) },
+    agents: { get(id) { return agentRef && agentRef.session.id === id ? agentRef : undefined } },
     on(name, fn, opts) {
-      assert.equal(name, 'agent/request-error')
-      assert.equal(opts.prepend, true)
-      listener = fn
-      return () => { listener = undefined }
+      if (name === 'agent/request-error') {
+        assert.equal(opts.prepend, true)
+        listener = fn
+      } else {
+        assert.equal(name, 'session/event')
+        assert.equal(opts, undefined)
+        sessionListener = fn
+      }
+      return () => { if (name === 'agent/request-error') listener = undefined; else sessionListener = undefined }
     },
   }
   apply(ctx, { jitter: false, minWaitSeconds: 0, language: 'zh', ...config })
   const agent = { session: { id: 's1', append: (type, data) => events.push({ type, data }) } }
+  agentRef = agent
   let nextCalls = 0
   const fire = (failure, { step = 1, signal, provider = 'deepseek' } = {}) =>
     listener({ agent, turn: 1, step, provider, failure, signal }, async () => { nextCalls += 1; return undefined })
+  const emitSession = (event, sessionId = 's1') => sessionListener({ id: sessionId }, event)
   const api = {
     store,
     failResolve,
     events,
     fire,
+    emitSession,
+    agent,
     nextCalls: () => nextCalls,
     log: async () => (await command.handler()).text,
     dispose: () => disposers.forEach((d) => d()),
@@ -498,4 +510,59 @@ test('a rejected key is replaced even when the step has no retries left', async 
   assert.equal(await h.fire({ code: 'AUTH', message: '401: Invalid API key' }), undefined)
   assert.equal(h.nextCalls(), 1)
   assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'bbb')
+})
+
+const maxTokens = (turn = 1) => ({ type: 'turn/end', data: { turn, reason: { kind: 'max-tokens' } } })
+const settle = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test('unattended mode sends 继续 after a max-tokens turn', async () => {
+  const h = harness({ unattended: true })
+  const sent = []
+  h.agent.followup = (message) => sent.push(message)
+  h.emitSession(maxTokens())
+  await settle()
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].role, 'user')
+  assert.equal(sent[0].content[0].text, '继续')
+  assert.equal(sent[0].source.kind, 'user')
+})
+
+test('manual mode leaves the prompt to the UI', async () => {
+  const h = harness({ unattended: false })
+  let sent = 0
+  h.agent.followup = () => { sent += 1 }
+  h.emitSession(maxTokens())
+  await settle()
+  assert.equal(sent, 0)
+})
+
+test('unattended mode uses the configured continue text', async () => {
+  const h = harness({ unattended: true, continueText: '接着写' })
+  const sent = []
+  h.agent.followup = (message) => sent.push(message)
+  h.emitSession(maxTokens())
+  await settle()
+  assert.equal(sent[0].content[0].text, '接着写')
+})
+
+test('unattended mode stops after 20 consecutive truncations', async () => {
+  const h = harness({ unattended: true })
+  let sent = 0
+  h.agent.followup = () => { sent += 1 }
+  for (let i = 0; i < 25; i += 1) h.emitSession(maxTokens(i + 1))
+  await settle(20)
+  assert.equal(sent, 20)
+  assert.match(await h.log(), /自动继续/)
+})
+
+test('a finished turn resets the consecutive counter', async () => {
+  const h = harness({ unattended: true })
+  let sent = 0
+  h.agent.followup = () => { sent += 1 }
+  for (let i = 0; i < 20; i += 1) h.emitSession(maxTokens(i + 1))
+  await settle(20)
+  h.emitSession({ type: 'turn/end', data: { turn: 21, reason: { kind: 'completed' } } })
+  h.emitSession(maxTokens(22))
+  await settle()
+  assert.equal(sent, 21)
 })

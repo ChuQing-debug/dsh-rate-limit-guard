@@ -48,6 +48,16 @@ window.__ModuleLoader__.load({
         jitterHint: '在等待时长上随机增加最多 10%（不超过 5 秒），避免多个会话同时重试。',
         waitOnQuota: '额度耗尽时也等待',
         waitOnQuotaHint: '默认关闭：QUOTA / ACCOUNT_QUOTA 表示余额或额度用完，等待无法恢复，会直接交回默认处理。',
+        unattendedTitle: '无人值守',
+        unattendedDesc: '回答达到输出 token 上限被截断时，不需要你确认就自动发送“继续”。',
+        unattended: '输出被截断时自动继续',
+        unattendedHint: '关闭时会在输入框上方弹出提示条，由你点击确认后继续；开启后插件自动发送下面的内容。',
+        continueText: '自动发送的内容',
+        continueTextHint: '默认是“继续”。只在开启无人值守时使用。',
+        bannerTitle: '回答因输出 token 上限被截断。',
+        bannerHint: '发送“继续”即可让模型接着写下去。',
+        bannerFill: '填入“继续”',
+        bannerDismiss: '关闭',
         maxAttempts: '每步骤最多重试次数',
         maxAttemptsHint: '达到上限后交回默认重试策略，避免无限等待。',
         maxTotalWaitMinutes: '每步骤累计等待上限（分钟）',
@@ -118,6 +128,16 @@ window.__ModuleLoader__.load({
         jitterHint: 'Adds up to 10 % (at most 5 s) to each wait so sessions do not all retry at once.',
         waitOnQuota: 'Wait on exhausted quota too',
         waitOnQuotaHint: 'Off by default: QUOTA / ACCOUNT_QUOTA means the balance or quota is used up, so waiting cannot help and the failure is handed back.',
+        unattendedTitle: 'Unattended',
+        unattendedDesc: 'Send “继续” automatically when the reply is cut off at the output token cap.',
+        unattended: 'Continue automatically when output is cut off',
+        unattendedHint: 'Off: a prompt above the composer lets you confirm. On: the text below is sent automatically.',
+        continueText: 'Text sent automatically',
+        continueTextHint: 'Defaults to “继续”. Used only when unattended mode is on.',
+        bannerTitle: 'The reply was cut off at the output token limit.',
+        bannerHint: 'Send “继续” to let the model keep writing.',
+        bannerFill: 'Fill continue',
+        bannerDismiss: 'Dismiss',
         maxAttempts: 'Retries per step',
         maxAttemptsHint: 'After this cap the ordinary retry policy takes over.',
         maxTotalWaitMinutes: 'Total wait per step (minutes)',
@@ -213,6 +233,10 @@ window.__ModuleLoader__.load({
 .rlg-banner { padding: 10px 14px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 1.6; background: var(--dsw-alias-bg-layer-2); }
 .rlg-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 16px 2px; color: var(--dsw-alias-label-secondary); font-size: 12.5px; }
 .rlg-error { color: var(--dsw-alias-state-error-primary); }
+.rlg-dock { display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px; margin: 0 0 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font-size: 12.5px; line-height: 1.6; }
+.rlg-dock-body { flex: 1; min-width: 0; }
+.rlg-dock-title { color: var(--dsw-alias-label-primary); font-weight: 600; }
+.rlg-dock-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 `
 
     function splitList(text) {
@@ -289,6 +313,8 @@ window.__ModuleLoader__.load({
         quotaCooldownMinutes: String(v.quotaCooldownMinutes ?? 60),
         keepOriginalKey: v.keepOriginalKey !== false,
         guardedProviders: Array.isArray(v.guardedProviders) ? v.guardedProviders.join(', ') : '',
+        unattended: v.unattended === true,
+        continueText: String(v.continueText ?? '继续'),
       }
     }
 
@@ -320,6 +346,8 @@ window.__ModuleLoader__.load({
         { op: 'set', path: ['quotaCooldownMinutes'], value: numberOr(draft.quotaCooldownMinutes, 60, 1, 10080) },
         { op: 'set', path: ['keepOriginalKey'], value: draft.keepOriginalKey === true },
         { op: 'set', path: ['guardedProviders'], value: splitList(draft.guardedProviders) },
+        { op: 'set', path: ['unattended'], value: draft.unattended === true },
+        { op: 'set', path: ['continueText'], value: String(draft.continueText ?? '').trim() || '继续' },
       ]
     }
 
@@ -406,6 +434,71 @@ window.__ModuleLoader__.load({
             disabled: disabled || busy || String(draftValue ?? '').trim() === '',
             onClick: onSave,
           }, busy ? t('saving') : t('saveKey'))))
+    }
+
+    function TruncationBanner({ api, input, binding, t }) {
+      const [pending, setPending] = React.useState(null)
+
+      React.useEffect(() => {
+        if (!binding) return undefined
+        let active = true
+        const observe = async (event) => {
+          if (event.type === 'user/message' || event.type === 'turn/start') {
+            if (active) setPending(null)
+            return
+          }
+          if (event.type !== 'turn/end') return
+          if (event.data?.reason?.kind !== 'max-tokens') {
+            if (active) setPending(null)
+            return
+          }
+          let continueText = '继续'
+          try {
+            const result = await api.read()
+            const value = result.view?.value ?? {}
+            if (value.unattended === true) {
+              // The host already sent "continue" for this truncation.
+              if (active) setPending(null)
+              return
+            }
+            if (typeof value.continueText === 'string' && value.continueText.trim() !== '') {
+              continueText = value.continueText
+            }
+          } catch {
+            /* settings unreadable: still offer the default manual prompt */
+          }
+          if (active) setPending({ turn: event.data.turn, continueText })
+        }
+        const stop = binding.eventSource.subscribe(() => {
+          const { change } = binding.eventSource.getSnapshot()
+          if (change?.kind !== 'append') return
+          for (const entry of change.entries ?? []) {
+            if (entry?.event) void observe(entry.event)
+          }
+        })
+        return () => {
+          active = false
+          stop()
+        }
+      }, [api, binding])
+
+      if (!pending) return null
+      const fill = () => {
+        try {
+          input?.setDraft(pending.continueText)
+          input?.focus?.()
+        } catch {
+          /* the session may have closed while the prompt was visible */
+        }
+        setPending(null)
+      }
+      return h('div', { className: 'rlg-dock' },
+        h('div', { className: 'rlg-dock-body' },
+          h('div', { className: 'rlg-dock-title' }, t('bannerTitle')),
+          h('div', null, t('bannerHint'))),
+        h('div', { className: 'rlg-dock-actions' },
+          h('button', { className: 'rlg-button rlg-button-primary', type: 'button', disabled: !input, onClick: fill }, t('bannerFill')),
+          h('button', { className: 'rlg-button rlg-button-secondary', type: 'button', onClick: () => setPending(null) }, t('bannerDismiss'))))
     }
 
     function Section({ api, t }) {
@@ -566,6 +659,24 @@ window.__ModuleLoader__.load({
           checkRow('jitter'),
           checkRow('waitOnQuota')) : null,
 
+        h(Card, { title: t('unattendedTitle'), desc: t('unattendedDesc') },
+          h(Row, { label: t('unattended'), hint: t('unattendedHint') },
+            h(Check, {
+              checked: draft.unattended === true,
+              disabled: !writable,
+              label: t('unattended'),
+              onChange: (checked) => update({ unattended: checked }),
+            })),
+          h(Row, { label: t('continueText'), hint: t('continueTextHint') },
+            h('input', {
+              className: 'rlg-input',
+              type: 'text',
+              spellCheck: false,
+              value: draft.continueText,
+              disabled: !writable,
+              onChange: (event) => update({ continueText: event.target.value }),
+            }))),
+
         h(Card, { title: t('keysTitle'), desc: t('keysDesc') },
           h(Row, { label: t('credentialRef'), hint: t('credentialRefHint') },
             h('input', {
@@ -675,6 +786,27 @@ window.__ModuleLoader__.load({
           label: () => t('nav'),
           inject: () => ({ api, t }),
         }, Section))
+
+        // Manual-mode prompt: a small bar above the composer appears when a turn is cut off by the
+        // output token cap and unattended mode is off.
+        ctx.inject(['sessions'], (scope) => {
+          scope.slots.inject('conversation.input.dock', () => scope.slots.register({
+            name: 'conversation.input.dock',
+            id: 'rate-limit-guard-truncation',
+            order: 30,
+            inject: (sessionId) => {
+              const binding = scope.sessions.binding(sessionId)
+              const actx = binding ? scope.sessions.scope(sessionId) : undefined
+              const conversation = actx?.get?.('conversation')
+              return {
+                api,
+                t,
+                binding,
+                input: conversation ? conversation.input.for(actx) : undefined,
+              }
+            },
+          }, TruncationBanner))
+        })
       },
     }
   },

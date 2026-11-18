@@ -1,6 +1,6 @@
 {
   "name": "dsh-rate-limit-guard",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Wait out provider rate limits or rotate to another API key, with a settings UI and an event log.",
   "license": "MIT",
   "repository": {
@@ -31,7 +31,12 @@
     "locale/*.json",
     "docs",
     "vendor",
-    "icon.svg"
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "bundle": {
@@ -43,7 +48,10 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-api-remotes"
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-session"
       ]
     }
   }

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1
+
+### Added
+- Settings switch **无人值守 / Unattended**: when a turn ends because the model hit its output
+  token cap (`turn/end` with `reason.kind === 'max-tokens'`), the plugin sends the configured
+  continue message (`continueText`, default `继续`) to the same session, so a long answer
+  resumes without user interaction. Consecutive auto-continues are capped at 20 and reset by
+  any completed turn or after 30 minutes; the cap is logged once.
+- With unattended mode off, a small bar above the composer offers **填入「继续」** (fills the
+  draft and focuses the input) and dismiss; the built-in “output token limit reached” notice
+  stays as before.
+- `/ratelimit-log` now prints the unattended state and auto-continue events
+  (`auto-continue`, `auto-continue-capped`).
+- Tests for auto-continue on/off, custom text, the 20-turn cap, counter reset, and both
+  banner states (67 tests total).
+
 ## 0.3.0
 
 Verified against DeepSeek Harness 0.2.2-rc.3 (headless and web profiles in an isolated
