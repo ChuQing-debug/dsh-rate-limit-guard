@@ -43,12 +43,13 @@ const CLOCK_SLOP_MS = 50
 /** How long after a rotation an auth failure is blamed on the key that rotation installed. */
 const REJECT_WINDOW_MS = 60_000
 /** A key the provider rejected stays out of the rotation this long (or until the plugin reloads). */
-const REJECTED_KEY_COOLDOWN_MS = 24 * 60 * 60 * 1000
+const REJECTED_KEY_COOLDOWN_MS = 60 * 60 * 1000
 /**
- * At most this many pool keys are benched as "rejected" per rate-limit rotation. An auth failure that
- * follows every key around is not about the keys, and must not bench the whole pool.
+ * At most this many pool keys of one reference are benched as "rejected" within the window below.
+ * An auth failure that follows every key around is not about the keys, and must not bench the pool.
  */
-const MAX_REJECTS_PER_ROTATION = 2
+const MAX_REJECTS_PER_WINDOW = 2
+const REJECT_LIMIT_WINDOW_MS = 10 * 60 * 1000
 
 export const Config = z.object({
   mode: z.union(['wait', 'rotate']).default('wait').volatile(),
@@ -57,6 +58,8 @@ export const Config = z.object({
   maxWaitSeconds: z.number().default(900).volatile(),
   maxAttempts: z.number().default(12).volatile(),
   minWaitSeconds: z.number().default(1).volatile(),
+  maxTotalWaitMinutes: z.number().default(60).volatile(),
+  language: z.union(['auto', 'zh', 'en']).default('auto').volatile(),
   jitter: z.boolean().default(true).volatile(),
   waitOnQuota: z.boolean().default(false).volatile(),
   quotaCooldownMinutes: z.number().default(60).volatile(),
@@ -174,18 +177,51 @@ function shortTime(iso) {
   }
 }
 
+/** Like shortTime, but with the date when the moment is not today (a key benched until tomorrow). */
+function untilTime(ms) {
+  const date = new Date(ms)
+  const time = shortTime(date.toISOString())
+  if (date.toDateString() === new Date().toDateString()) return time
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
+}
+
 const ACTION_LABELS = {
-  detected: '检测到限流',
-  waiting: '进入等待',
-  resumed: '已恢复并继续',
-  aborted: '等待被取消',
-  rotated: '已轮换密钥',
-  'rotate-raced': '刚轮换过，直接重试',
-  'rotate-unavailable': '无法轮换密钥',
-  'key-rejected': '密钥被拒绝',
-  'original-saved': '已备份原密钥',
-  'quota-handoff': '额度耗尽，交回处理',
-  exhausted: '达到重试上限',
+  zh: {
+    detected: '检测到限流',
+    waiting: '进入等待',
+    resumed: '已恢复并继续',
+    aborted: '等待被取消',
+    rotated: '已轮换密钥',
+    'rotate-raced': '刚轮换过，直接重试',
+    'rotate-unavailable': '无法轮换密钥',
+    'key-rejected': '密钥被拒绝',
+    'original-saved': '已备份原密钥',
+    'quota-handoff': '额度耗尽，交回处理',
+    exhausted: '达到上限',
+  },
+  en: {
+    detected: 'Rate limit detected',
+    waiting: 'Waiting',
+    resumed: 'Resumed',
+    aborted: 'Wait cancelled',
+    rotated: 'Key rotated',
+    'rotate-raced': 'Just rotated, retrying',
+    'rotate-unavailable': 'Cannot rotate',
+    'key-rejected': 'Key rejected',
+    'original-saved': 'Original key backed up',
+    'quota-handoff': 'Quota exhausted, handed back',
+    exhausted: 'Limit reached',
+  },
+}
+
+/** Language for log notes and /ratelimit-log when the setting is "auto": follow the process locale. */
+function systemLanguage() {
+  try {
+    return /^zh\b/i.test(Intl.DateTimeFormat().resolvedOptions().locale) ? 'zh' : 'en'
+  } catch {
+    return 'en'
+  }
 }
 
 export function apply(ctx, config = {}) {
@@ -196,9 +232,20 @@ export function apply(ctx, config = {}) {
   const cooldowns = new Map()
   /** target ref -> { id, at, setAt, toFp, provider, rejects } of the latest rotation */
   const lastRotation = new Map()
+  /** fingerprints of keys benched because the provider rejected them (subset of `cooldowns`) */
+  const rejectedFps = new Set()
+  /** target ref -> timestamps of recent benches, for MAX_REJECTS_PER_WINDOW */
+  const rejectTimes = new Map()
   /** target ref -> tail of the promise chain that serializes rotations of that ref */
   const locks = new Map()
   let credentials
+
+  /** Pick the Chinese or English text for log notes and the /ratelimit-log report. */
+  function language() {
+    const value = readField(config.language, 'auto')
+    return value === 'zh' || value === 'en' ? value : systemLanguage()
+  }
+  const L = (zh, en) => (language() === 'en' ? en : zh)
 
   ctx.inject(['credentials'], (sub) => {
     credentials = sub.credentials
@@ -226,6 +273,7 @@ export function apply(ctx, config = {}) {
       maxWaitSeconds: readNumber(config.maxWaitSeconds, 900, 1, 86400),
       maxAttempts: readNumber(config.maxAttempts, 12, 1, 100),
       minWaitSeconds: readNumber(config.minWaitSeconds, 1, 0, 60),
+      maxTotalWaitMinutes: readNumber(config.maxTotalWaitMinutes, 60, 0, 7 * 24 * 60),
       jitter: readBoolean(config.jitter, true),
       waitOnQuota: readBoolean(config.waitOnQuota, false),
       quotaCooldownMinutes: readNumber(config.quotaCooldownMinutes, 60, 1, 7 * 24 * 60),
@@ -285,42 +333,102 @@ export function apply(ctx, config = {}) {
   }
 
   function describeEntry(entry) {
-    const label = ACTION_LABELS[entry.action] ?? entry.action
+    const label = ACTION_LABELS[language()][entry.action] ?? entry.action
     const bits = []
     if (entry.provider) bits.push(entry.provider)
     if (entry.code) bits.push(entry.code)
-    if (typeof entry.retry === 'number') bits.push(`第 ${entry.retry} 次`)
-    if (typeof entry.delayMs === 'number') bits.push(`等待 ${Math.round(entry.delayMs / 1000)}s`)
-    if (entry.resumeAt) bits.push(`预计 ${shortTime(entry.resumeAt)} 恢复`)
-    if (entry.keyRef) bits.push(`写入 ${entry.keyRef}`)
+    if (typeof entry.retry === 'number') bits.push(L(`第 ${entry.retry} 次`, `attempt ${entry.retry}`))
+    if (typeof entry.delayMs === 'number') bits.push(L(`等待 ${Math.round(entry.delayMs / 1000)}s`, `wait ${Math.round(entry.delayMs / 1000)}s`))
+    if (entry.resumeAt) bits.push(L(`预计 ${shortTime(entry.resumeAt)} 恢复`, `resumes at ${shortTime(entry.resumeAt)}`))
+    if (entry.keyRef) bits.push(L(`写入 ${entry.keyRef}`, `wrote ${entry.keyRef}`))
     if (entry.note) bits.push(entry.note)
     return `${label}${bits.length ? ` · ${bits.join(' · ')}` : ''}`
   }
 
-  function renderLog() {
+  /** Target references rotation can write: the default one plus every mapped one. */
+  function targetRefs(cfg) {
+    const refs = [cfg.credentialRef]
+    for (const item of cfg.providerRefs) {
+      const separator = item.indexOf('=')
+      if (separator <= 0) continue
+      const ref = item.slice(separator + 1).trim()
+      if (isValidRef(ref) && !refs.includes(ref)) refs.push(ref)
+    }
+    return refs
+  }
+
+  /** Which pool key each target currently holds and which keys are cooling. Names and times only, never values. */
+  async function keyStatusLines(cfg) {
+    const lines = []
+    if (!credentials) return [L('凭据服务不可用，无法轮换。', 'The credentials service is unavailable; rotation is off.')]
+    const now = Date.now()
+    for (const ref of targetRefs(cfg)) {
+      const target = await readTarget(ref)
+      const pool = await loadPool(cfg, ref)
+      const currentFp = target.ok && target.value !== undefined ? fingerprint(target.value) : undefined
+      const holder = pool.find((entry) => entry.fp === currentFp)
+      const current = !target.ok
+        ? L('读取失败', 'unreadable')
+        : currentFp === undefined
+          ? L('未配置', 'not configured')
+          : holder ? holder.ref : L('池外的密钥', 'a key outside the pool')
+      lines.push(L(`  ${ref} 当前使用：${current}`, `  ${ref} currently holds: ${current}`))
+      for (const entry of pool) {
+        const until = cooldowns.get(entry.fp) ?? 0
+        const state = until <= now
+          ? L('可用', 'ready')
+          : rejectedFps.has(entry.fp)
+            ? L(`被服务端拒绝，暂停到 ${untilTime(until)}`, `rejected by the provider, benched until ${untilTime(until)}`)
+            : L(`冷却到 ${untilTime(until)}`, `cooling until ${untilTime(until)}`)
+        lines.push(`    ${entry.ref}: ${state}`)
+      }
+      if (pool.length === 0) lines.push(L('    （密钥池为空）', '    (the pool is empty)'))
+    }
+    return lines
+  }
+
+  async function renderLog() {
     const cfg = readConfig()
     const modeText = cfg.mode === 'rotate'
-      ? `轮换密钥（目标 ${cfg.credentialRef}${cfg.alternateKeyRefs.length ? `，${cfg.alternateKeyRefs.length} 个备用引用` : '，未配置备用引用'}${cfg.keepOriginalKey ? `，原密钥备份在 ${backupRefFor(cfg.credentialRef)}` : ''}）`
-      : `等待（默认 ${cfg.waitSeconds}s，上限 ${cfg.maxWaitSeconds}s）`
-    const lines = [`限流守护 · 当前模式：${modeText}`]
-    const now = Date.now()
-    const cooling = [...cooldowns.values()].filter((until) => until > now).length
-    if (cooling > 0) lines.push(`冷却中的密钥：${cooling} 个`)
+      ? L(
+        `轮换密钥（目标 ${cfg.credentialRef}，${cfg.alternateKeyRefs.length} 个备用引用）`,
+        `rotate key (target ${cfg.credentialRef}, ${cfg.alternateKeyRefs.length} alternate reference(s))`,
+      )
+      : L(
+        `等待（默认 ${cfg.waitSeconds}s，单次上限 ${cfg.maxWaitSeconds}s）`,
+        `wait (default ${cfg.waitSeconds}s, at most ${cfg.maxWaitSeconds}s each)`,
+      )
+    const lines = [L(`限流守护 · 当前模式：${modeText}`, `Rate limit guard · mode: ${modeText}`)]
+    if (cfg.mode === 'rotate') {
+      lines.push(L('密钥状态：', 'Key status:'))
+      try {
+        lines.push(...await keyStatusLines(cfg))
+      } catch (error) {
+        lines.push(L(`  无法读取密钥状态：${messageOf(error)}`, `  could not read key status: ${messageOf(error)}`))
+      }
+    }
     if (logs.length === 0) {
-      lines.push('尚未记录到限流事件。')
+      lines.push(L('尚未记录到限流事件。', 'No rate limit events recorded yet.'))
       return lines.join('\n')
     }
-    lines.push(`最近事件（${Math.min(logs.length, 20)}/${logs.length} 条）：`)
+    lines.push(L(
+      `最近事件（${Math.min(logs.length, 20)}/${logs.length} 条）：`,
+      `Recent events (${Math.min(logs.length, 20)} of ${logs.length}):`,
+    ))
     for (const entry of logs.slice(-20)) {
       lines.push(`  ${shortTime(entry.at)}  ${describeEntry(entry)}`)
     }
-    lines.push('提示：对话中每次等待也会显示一条带倒计时的重试行。')
+    lines.push(L('提示：对话中每次等待也会显示一条带倒计时的重试行。', 'Tip: each wait also shows a countdown row in the conversation.'))
     return lines.join('\n')
   }
 
   function prune() {
     const now = Date.now()
-    for (const [fp, until] of cooldowns) if (until <= now) cooldowns.delete(fp)
+    for (const [fp, until] of cooldowns) {
+      if (until > now) continue
+      cooldowns.delete(fp)
+      rejectedFps.delete(fp)
+    }
     if (attempts.size <= STATE_LIMIT) return
     const cutoff = now - STATE_TTL_MS
     for (const [key, entry] of attempts) {
@@ -385,18 +493,27 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** Pool in rotation order: the backed-up keys first, then the configured alternates. */
+  /**
+   * Pool in rotation order: the backed-up keys first, then the configured alternates.
+   * `pool.unreadable` lists backup slots that could not be read: they may hold a key, so nothing may
+   * be written to them (an alternate that cannot be read is simply skipped).
+   */
   async function loadPool(cfg, ref) {
-    const refs = []
-    if (cfg.keepOriginalKey) refs.push(backupRefFor(ref), previousRefFor(ref))
+    const slots = cfg.keepOriginalKey ? [backupRefFor(ref), previousRefFor(ref)] : []
+    const refs = [...slots]
     for (const alt of cfg.alternateKeyRefs) if (alt !== ref && !refs.includes(alt)) refs.push(alt)
     const pool = []
+    pool.unreadable = []
     for (const poolRef of refs) {
-      const value = await resolveValue(poolRef)
-      if (value === undefined) continue
-      const fp = fingerprint(value)
+      const read = await readTarget(poolRef)
+      if (!read.ok) {
+        if (slots.includes(poolRef)) pool.unreadable.push(poolRef)
+        continue
+      }
+      if (read.value === undefined) continue
+      const fp = fingerprint(read.value)
       if (pool.some((entry) => entry.fp === fp)) continue
-      pool.push({ ref: poolRef, fp, value })
+      pool.push({ ref: poolRef, fp, value: read.value })
     }
     return pool
   }
@@ -408,10 +525,10 @@ export function apply(ctx, config = {}) {
    */
   function rotate(cfg, ref, state, cooldownMs, provider) {
     return withLock(ref, async () => {
-      if (lifetime.signal.aborted) return { ok: false, reason: '插件已卸载' }
+      if (lifetime.signal.aborted) return { ok: false, reason: L('插件已卸载', 'the plugin was unloaded') }
       const now = Date.now()
       const target = await readTarget(ref)
-      if (!target.ok) return { ok: false, reason: `无法读取 ${ref}: ${messageOf(target.error)}` }
+      if (!target.ok) return { ok: false, reason: L(`无法读取 ${ref}: ${messageOf(target.error)}`, `cannot read ${ref}: ${messageOf(target.error)}`) }
       const current = target.value
       const currentFp = current === undefined ? undefined : fingerprint(current)
 
@@ -426,33 +543,39 @@ export function apply(ctx, config = {}) {
       let pool = await loadPool(cfg, ref)
       const backupRef = backupRefFor(ref)
       const previousRef = previousRefFor(ref)
-      const hasAlternates = pool.some((entry) => entry.ref !== backupRef && entry.ref !== previousRef)
-      if (cfg.keepOriginalKey && hasAlternates && current !== undefined && !pool.some((entry) => entry.fp === currentFp)) {
-        // The key in use is not in the pool (the user's own key): keep a copy before overwriting it,
-        // so it rejoins the rotation once its window refreshes. The first such key goes to the
-        // ORIGINAL slot and is never overwritten; a later one goes to the PREVIOUS slot.
-        const slot = pool.some((entry) => entry.ref === backupRef) ? previousRef : backupRef
+      if (cfg.keepOriginalKey && pool.length > 0 && current !== undefined && !pool.some((entry) => entry.fp === currentFp)) {
+        // The key in use is stored nowhere else (the user's own key): keep a copy before overwriting
+        // it, so it rejoins the rotation once its window refreshes. A slot that already holds a key
+        // is never overwritten: the first such key goes to ORIGINAL, a later one to PREVIOUS, and
+        // when neither slot is free (or one cannot be read) the rotation is refused instead.
+        if (pool.unreadable.length > 0) {
+          return { ok: false, reason: L(`无法读取备份引用 ${pool.unreadable.join('、')}，为避免覆盖其中的密钥，本次不轮换`, `cannot read the backup reference ${pool.unreadable.join(', ')}; not rotating, so the key in it is not overwritten`) }
+        }
+        const slot = [backupRef, previousRef].find((candidate) => !pool.some((entry) => entry.ref === candidate))
+        if (!slot) {
+          return { ok: false, reason: L(`${ref} 里是一个未备份的新密钥，而 ${backupRef} 和 ${previousRef} 都已占用；为避免丢失密钥，本次不轮换（请把它加入备用密钥，或清理这两个备份引用）`, `${ref} holds a new key that has no backup, and both ${backupRef} and ${previousRef} are in use; not rotating so no key is lost (add it to the pool, or clear one of the two backup references)`) }
+        }
         try {
           await credentials.set(slot, current)
         } catch (error) {
-          return { ok: false, reason: `无法备份原密钥到 ${slot}: ${messageOf(error)}` }
+          return { ok: false, reason: L(`无法备份原密钥到 ${slot}: ${messageOf(error)}`, `cannot back up the original key to ${slot}: ${messageOf(error)}`) }
         }
         const saved = { ref: slot, fp: currentFp, value: current }
         const rest = pool.filter((entry) => entry.ref !== slot)
         const head = rest.filter((entry) => entry.ref === backupRef)
         pool = [...head, saved, ...rest.filter((entry) => entry.ref !== backupRef)]
-        record('info', { action: 'original-saved', keyRef: slot, note: `轮换前把 ${ref} 的原值保存到 ${slot}` })
+        record('info', { action: 'original-saved', keyRef: slot, note: L(`轮换前把 ${ref} 的原值保存到 ${slot}`, `saved the value of ${ref} to ${slot} before rotating`) })
       }
 
       const choice = pickNext(pool, currentFp, cooldowns, now)
       if (!choice.pick) {
-        if (choice.readyAt === undefined) return { ok: false, reason: '未配置可用的备用密钥' }
-        return { ok: false, reason: '密钥池中的密钥都在冷却中', readyAt: choice.readyAt }
+        if (choice.readyAt === undefined) return { ok: false, reason: L('未配置可用的备用密钥', 'no usable alternate key is configured') }
+        return { ok: false, reason: L('密钥池中的密钥都在冷却中', 'every key in the pool is cooling down'), readyAt: choice.readyAt }
       }
       try {
         await credentials.set(ref, choice.pick.value)
       } catch (error) {
-        return { ok: false, reason: `无法写入 ${ref}: ${messageOf(error)}` }
+        return { ok: false, reason: L(`无法写入 ${ref}: ${messageOf(error)}`, `cannot write ${ref}: ${messageOf(error)}`) }
       }
       noteRotation(ref, choice.pick.fp, provider, state)
       return { ok: true, keyRef: choice.pick.ref, target: ref }
@@ -479,15 +602,19 @@ export function apply(ctx, config = {}) {
       if (last.toFp !== currentFp) return { handled: false }
       // Another request already replaced the rejected key; this failure most likely still used the old
       // one. Retry once on the replacement instead of benching a key nobody has tried yet.
-      if (last.rejects > 0 && now - last.setAt < ROTATE_GRACE_MS && state.graceFor !== last.id) {
+      // (No time limit beyond the blame window: a slow request may fail well after the swap.)
+      if (last.rejects > 0 && state.graceFor !== last.id) {
         state.graceFor = last.id
         return { handled: true, raced: true }
       }
-      if (last.rejects >= MAX_REJECTS_PER_ROTATION) return { handled: false }
+      const recent = (rejectTimes.get(ref) ?? []).filter((at) => now - at < REJECT_LIMIT_WINDOW_MS)
+      if (recent.length >= MAX_REJECTS_PER_WINDOW) return { handled: false }
       const pool = await loadPool(cfg, ref)
       const rejected = pool.find((entry) => entry.fp === currentFp)
       if (!rejected) return { handled: false }
       cooldowns.set(currentFp, now + REJECTED_KEY_COOLDOWN_MS)
+      rejectedFps.add(currentFp)
+      rejectTimes.set(ref, [...recent, now])
       const choice = pickNext(pool, currentFp, cooldowns, now)
       // Nothing ready: still swap in the key that comes back first, so the rejected one is not left behind.
       const pick = choice.pick ?? pool
@@ -519,6 +646,8 @@ export function apply(ctx, config = {}) {
       const currentFp = current === undefined ? undefined : fingerprint(current)
       if (currentFp && (cooldowns.get(currentFp) ?? 0) <= now) return undefined
       const pool = await loadPool(cfg, ref)
+      // Only replace a key that is also stored in the pool; anything else would be lost.
+      if (currentFp && !pool.some((entry) => entry.fp === currentFp)) return undefined
       const choice = pickNext(pool, currentFp, cooldowns, now)
       if (!choice.pick) return undefined
       try {
@@ -531,7 +660,28 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  async function waitAndRetry({ agent, turn, step, provider, failure, signal }, base, delayMs, note, after) {
+  async function waitAndRetry({ agent, turn, step, provider, failure, signal }, { state, base }, cfg, next, delayMs, note, after) {
+    // One step may only sit waiting for so long in total, whatever the per-wait cap and retry count allow.
+    const budgetMs = cfg.maxTotalWaitMinutes * 60_000
+    // A wait longer than what is left is shortened to it (one last try) rather than skipped.
+    if (budgetMs > 0) delayMs = Math.min(delayMs, Math.max(0, budgetMs - state.waitedMs))
+    if (budgetMs > 0 && state.waitedMs >= budgetMs) {
+      if (!state.exhausted) {
+        state.exhausted = true
+        record('warn', {
+          action: 'exhausted',
+          provider,
+          code: failure.code,
+          retry: base.retry,
+          note: L(
+            `本步骤累计等待已达到 ${cfg.maxTotalWaitMinutes} 分钟上限，交回后续处理器`,
+            `this step has used its ${cfg.maxTotalWaitMinutes} minute total wait budget, handing back`,
+          ),
+        })
+      }
+      return next()
+    }
+    state.waitedMs += delayMs
     const resumeAt = new Date(Date.now() + delayMs).toISOString()
     appendScheduled(agent, { ...base, delayMs })
     record('info', {
@@ -551,7 +701,7 @@ export function apply(ctx, config = {}) {
         action: 'aborted',
         provider,
         retry: base.retry,
-        note: '等待被取消（会话中止或插件卸载）',
+        note: L('等待被取消（会话中止或插件卸载）', 'wait cancelled (session aborted or plugin unloaded)'),
       })
       // `undefined` is DSH's "do not retry" action.
       return undefined
@@ -564,7 +714,7 @@ export function apply(ctx, config = {}) {
       provider,
       retry: base.retry,
       delayMs,
-      note: '限额窗口已刷新，自动继续',
+      note: L('限额窗口已刷新，自动继续', 'the limit window has refreshed, continuing'),
     })
     return { kind: 'retry' }
   }
@@ -578,7 +728,7 @@ export function apply(ctx, config = {}) {
     const stateKey = `${agent?.session?.id ?? 'unknown'}:${turn}:${step}`
     let state = attempts.get(stateKey)
     if (!state) {
-      state = { count: 0, retryId: randomUUID(), startedAt: Date.now(), exhausted: false }
+      state = { count: 0, waitedMs: 0, retryId: randomUUID(), startedAt: Date.now(), exhausted: false }
       attempts.set(stateKey, state)
     }
     if (state.count >= cfg.maxAttempts) {
@@ -589,7 +739,7 @@ export function apply(ctx, config = {}) {
           provider,
           code: failure.code,
           retry: state.count,
-          note: `本步骤已达到 ${cfg.maxAttempts} 次上限，交回后续处理器`,
+          note: L(`本步骤已达到 ${cfg.maxAttempts} 次上限，交回后续处理器`, `this step reached the cap of ${cfg.maxAttempts} retries, handing back`),
         })
       }
       return undefined
@@ -628,7 +778,7 @@ export function apply(ctx, config = {}) {
     const outcome = await replaceRejected(cfg, ref, attempt.state, provider)
     if (!outcome.handled) return next()
     if (outcome.raced) {
-      record('info', { action: 'rotate-raced', provider, retry: attempt.retry, note: '被拒绝的密钥已被换掉，直接用新密钥重试' })
+      record('info', { action: 'rotate-raced', provider, retry: attempt.retry, note: L('被拒绝的密钥已被换掉，直接用新密钥重试', 'the rejected key was already replaced, retrying on the new key') })
       appendScheduled(agent, { ...attempt.base, delayMs: 0 })
       appendStarted(agent, { retryId: attempt.base.retryId, turn, step, retry: attempt.retry })
       return { kind: 'retry' }
@@ -639,8 +789,12 @@ export function apply(ctx, config = {}) {
       provider,
       code: failure.code,
       retry: attempt.retry,
-      note: `${outcome.rejectedRef} 的密钥被服务端拒绝，已暂停使用；${
-        outcome.keyRef === undefined ? '没有其他密钥可换' : usable ? `改用 ${outcome.keyRef} 重试` : `已换回 ${outcome.keyRef}（仍在冷却），交回后续处理器`}`,
+      note: L(
+        `${outcome.rejectedRef} 的密钥被服务端拒绝，已暂停使用；${
+          outcome.keyRef === undefined ? '没有其他密钥可换' : usable ? `改用 ${outcome.keyRef} 重试` : `已换回 ${outcome.keyRef}（仍在冷却），交回后续处理器`}`,
+        `the provider rejected the key from ${outcome.rejectedRef}, benched; ${
+          outcome.keyRef === undefined ? 'no other key to switch to' : usable ? `retrying with ${outcome.keyRef}` : `switched back to ${outcome.keyRef} (still cooling), handing back`}`,
+      ),
     })
     if (!usable) return next()
     appendScheduled(agent, { ...attempt.base, delayMs: 0 })
@@ -664,7 +818,7 @@ export function apply(ctx, config = {}) {
         action: 'quota-handoff',
         provider,
         code: failure.code,
-        note: '额度/余额已耗尽，等待不会恢复，交回默认处理',
+        note: L('额度/余额已耗尽，等待不会恢复，交回默认处理', 'quota or balance is exhausted; waiting cannot help, handing back'),
       })
       return next()
     }
@@ -683,11 +837,12 @@ export function apply(ctx, config = {}) {
 
     const { delayMs, source } = computeDelay(failure, cfg)
     const delayNote = source === 'retry-after'
-      ? '使用服务端建议的等待时长'
+      ? L('使用服务端建议的等待时长', 'using the wait the server suggested')
       : source === 'message-hint'
-        ? '从错误信息中解析出等待时长'
+        ? L('从错误信息中解析出等待时长', 'using the wait found in the error message')
         : undefined
     const fallback = quota && !cfg.waitOnQuota ? false : cfg.fallbackToWait
+    const fallbackNote = fallback ? L('，回退为等待', ', falling back to waiting') : L('，交回后续处理器', ', handing back')
 
     if (cfg.mode === 'rotate') {
       const ref = resolveRef(provider, cfg)
@@ -696,7 +851,7 @@ export function apply(ctx, config = {}) {
           action: 'rotate-unavailable',
           provider,
           retry,
-          note: `${credentials ? `提供方 ${provider} 没有可轮换的密钥` : 'credentials 服务不可用'}${fallback ? '，回退为等待' : '，交回后续处理器'}`,
+          note: `${credentials ? L(`提供方 ${provider} 没有可轮换的密钥`, `provider ${provider} has no key to rotate`) : L('credentials 服务不可用', 'the credentials service is unavailable')}${fallbackNote}`,
         })
         if (!fallback) return next()
       } else {
@@ -706,29 +861,29 @@ export function apply(ctx, config = {}) {
           appendScheduled(agent, { ...base, delayMs: 0 })
           appendStarted(agent, { retryId: base.retryId, turn, step, retry })
           record('info', outcome.raced
-            ? { action: 'rotate-raced', provider, retry, note: '失败请求很可能还在用旧密钥，直接用新密钥重试' }
-            : { action: 'rotated', provider, retry, keyRef: outcome.target, note: `使用 ${outcome.keyRef} 的值立即重试` })
+            ? { action: 'rotate-raced', provider, retry, note: L('失败请求很可能还在用旧密钥，直接用新密钥重试', 'the failed request most likely still used the old key, retrying on the new one') }
+            : { action: 'rotated', provider, retry, keyRef: outcome.target, note: L(`使用 ${outcome.keyRef} 的值立即重试`, `retrying at once with the value of ${outcome.keyRef}`) })
           return { kind: 'retry' }
         }
         record('warn', {
           action: 'rotate-unavailable',
           provider,
           retry,
-          note: `${outcome.reason}${fallback ? '，回退为等待' : '，交回后续处理器'}`,
+          note: `${outcome.reason}${fallbackNote}`,
         })
         if (!fallback) return next()
         if (outcome.readyAt !== undefined) {
           // Every key is cooling: wait for the first one to come back instead of hammering the pool.
-          const untilReady = Math.max(0, Math.min(outcome.readyAt - Date.now(), cfg.maxWaitSeconds * 1000))
-          return waitAndRetry(payload, base, Math.round(untilReady), '等待最早恢复的密钥', async () => {
+          const untilReady = Math.max(cfg.minWaitSeconds * 1000, Math.min(outcome.readyAt - Date.now(), cfg.maxWaitSeconds * 1000))
+          return waitAndRetry(payload, attempt, cfg, next, Math.round(untilReady), L('等待最早恢复的密钥', 'waiting for the first key to come back'), async () => {
             const restored = await restoreReady(cfg, ref, state, provider)
-            if (restored) record('info', { action: 'rotated', provider, retry, keyRef: ref, note: `等待后改用 ${restored}` })
+            if (restored) record('info', { action: 'rotated', provider, retry, keyRef: ref, note: L(`等待后改用 ${restored}`, `switched to ${restored} after waiting`) })
           })
         }
       }
     }
 
-    return waitAndRetry(payload, base, delayMs, delayNote)
+    return waitAndRetry(payload, attempt, cfg, next, delayMs, delayNote)
   }
 
   ctx.effect(() => {
@@ -749,6 +904,8 @@ export function apply(ctx, config = {}) {
       lifetime.abort()
       attempts.clear()
       cooldowns.clear()
+      rejectedFps.clear()
+      rejectTimes.clear()
       lastRotation.clear()
     }
   }, 'rate-limit-guard: request-error listener')
@@ -756,8 +913,8 @@ export function apply(ctx, config = {}) {
   ctx.inject(['commands'], (sub) => {
     sub.commands.register({
       name: 'ratelimit-log',
-      description: '查看限流守护最近的等待与轮换记录',
-      handler: () => ({ kind: 'success', text: renderLog() }),
+      description: L('查看限流守护最近的等待与轮换记录', 'Show recent rate limit guard waits and rotations'),
+      handler: async () => ({ kind: 'success', text: await renderLog() }),
     })
   })
 }

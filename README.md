@@ -38,12 +38,13 @@ log, and through a `/ratelimit-log` command.
   `ACCOUNT_QUOTA`) is never waited out by default, since waiting cannot refill a balance:
   rotate mode moves to another key, and otherwise the failure goes straight back to DSH.
 - **Hint parsing in English and Chinese** — `retry after 30s`, `try again in 1m30s`,
-  `resets in 6m0s`, `请在 30 秒后重试`, `1分30秒后重试`; waits get up to 10 % (max 5 s)
+  `resets in 6m0s`, `until 2026-11-18T11:11:52Z (~9s`, `请在 30 秒后重试`, `1分30秒后重试`; waits get up to 10 % (max 5 s)
   jitter so sessions limited together do not retry together.
 - **Auto-resume, not auto-fail** — returns `retry` for the current step of the agent loop;
   no restart, no lost turn.
-- **Bounded retries** — a per-step attempt cap (default 12) hands control back to the
-  default retry policy instead of looping forever.
+- **Bounded retries** — a per-step attempt cap (default 12) and a per-step total wait
+  budget (default 60 minutes) hand control back to the default retry policy instead of
+  looping or waiting forever.
 - **Visible interruptions** — each wait appears in the conversation as a live countdown
   row (reusing DSH's durable `llm/retry` / `llm/retry-started` events), and each event is
   written to the plugin log with a local timestamp and the expected resume time.
@@ -99,8 +100,8 @@ one step and resets for the next step or turn. Retrospective data (attempt count
   An excluded provider falls back to waiting (or hands the failure back when
   `fallbackToWait` is off).
 - Rotate mode needs the `credentials` service. It is on in the desktop and web profiles
-  and **off by default in `headless`**; there the guard logs "credentials 服务不可用" and
-  waits instead, unless the profile enables it (`- id: credentials` / `disabled: false`).
+  and **off by default in `headless`**; there the guard logs "the credentials service is
+  unavailable" (or its Chinese equivalent, according to `language`) and waits instead, unless the profile enables it (`- id: credentials` / `disabled: false`).
 
 ## Installation
 
@@ -146,6 +147,8 @@ next request. Values can also be supplied in the bundle's patch `config:` block.
 | `useRetryAfter` | `true` | Prefer `providerRetryAfterMs`, then a delay parsed from the error message (e.g. `retry after 30s`), then `waitSeconds`. |
 | `maxWaitSeconds` | `900` | Upper bound for any single wait. |
 | `maxAttempts` | `12` | Per-step retry cap; after this the failure goes back to the default policy. |
+| `maxTotalWaitMinutes` | `60` | Total time one step may spend waiting. The last wait is shortened to what is left; after that the failure goes back to the default policy (which may still retry a few times on its own). `0` disables the limit. |
+| `language` | `auto` | Language of log notes and `/ratelimit-log`: `auto` (system locale), `zh` or `en`. |
 | `minWaitSeconds` | `1` | Floor for any wait or key cooldown, so a hint like "try again in 6ms" cannot burn the retry budget. Not on the settings page. |
 | `jitter` | `true` | Add up to 10 % (at most 5 s) to each wait. |
 | `waitOnQuota` | `false` | Also wait on `QUOTA` / `ACCOUNT_QUOTA` (the previous behaviour). |
@@ -153,7 +156,7 @@ next request. Values can also be supplied in the bundle's patch `config:` block.
 | `credentialRef` | `DEEPSEEK_API_KEY` | The credential reference the provider reads and that rotation writes to. |
 | `alternateKeyRefs` | `[]` | Credential references that form the key pool. Only reference names are stored here. |
 | `providerRefs` | `[]` | Optional `provider=REFERENCE` lines for providers that read different references. `provider=-` marks a provider that has no key to rotate. |
-| `keepOriginalKey` | `true` | Before the first rotation away from a key that is not in the pool, save it to `<REF>_RLG_ORIGINAL` and rotate through it too. That slot is never overwritten; a later unknown key (for example one typed into the target afterwards) goes to `<REF>_RLG_PREVIOUS`. |
+| `keepOriginalKey` | `true` | Before the first rotation away from a key that is not in the pool, save it to `<REF>_RLG_ORIGINAL` and rotate through it too. Neither backup slot is ever overwritten: a later unknown key (for example one typed into the target afterwards) goes to `<REF>_RLG_PREVIOUS`, and if that is taken too the guard refuses to rotate (it waits instead) until the key is added to the pool or a slot is cleared. With this option off, rotation overwrites the target without a backup. |
 | `fallbackToWait` | `true` | When rotation is impossible, wait instead of handing the failure back. |
 | `guardedProviders` | `[]` | Allowlist of providers to guard; empty means all. |
 
@@ -187,12 +190,16 @@ very next request.
   fresh quota.
 - Watch the conversation: a waiting row shows the countdown, delay and failure details, and
   flips to "started" when the retry fires.
-- Type `/ratelimit-log` in a session to print the last 20 guard events (local time, action,
-  provider, failure code, mode, retry number, delay and resume time).
+- Type `/ratelimit-log` in a session to print, in rotate mode, which pool reference each
+  target currently holds and which keys are ready, cooling or rejected (names and times
+  only, never key values), followed by the last 20 guard events (local time, action,
+  provider, failure code, mode, retry number, delay and resume time). The report is in
+  Chinese or English according to `language`.
 - Host logs carry structured lines such as:
 
   ```
-  rate-limit-guard waiting at=21:07:42 provider=shusheng code=RATE_LIMIT mode=wait retry=2 delay=60s key=SHUSHENG_API_KEY resumeAt=21:08:42 note=使用默认等待时长
+  rate-limit-guard waiting at=21:07:42 provider=shusheng code=RATE_LIMIT mode=wait retry=2 delay=3s resumeAt=21:07:45 using the wait found in the error message
+  rate-limit-guard rotated at=21:09:10 provider=shusheng retry=1 key=SHUSHENG_API_KEY retrying at once with the value of SHUSHENG_KEY_BACKUP
   ```
 
 ## Limitations
@@ -204,20 +211,24 @@ very next request.
 - **Keyless providers.** `deepseek-account` and providers mapped to `-` have no API key to
   rotate. In rotate mode the guard logs the reason and falls back to waiting (unless
   `fallbackToWait` is off). Other keyless providers are not detected automatically.
-- **Retry-After headers may not arrive.** With DSH 0.2.2-rc.1 and an `openai-completions`
+- **Retry-After headers may not arrive.** With DSH 0.2.2-rc.3 and an `openai-completions`
   provider, a `Retry-After: 2` response header did not reach the plugin (the failure had
   no `providerRetryAfterMs`); only a hint in the error message is honoured there, otherwise
   the default wait applies.
 - **Rejected pool keys.** If the key a rotation just installed is rejected (`AUTH` / 401)
-  within a minute, for the same provider, the guard benches it for 24 h (in memory) and
-  installs the next pool key; at most two keys per rotation, so a failure that follows
-  every key cannot bench the pool. 403 is not treated as a rejected key (it usually means
+  within a minute, for the same provider, the guard benches it for an hour (in memory) and
+  installs the next pool key; at most two keys of a reference per ten minutes, so a failure
+  that follows every key cannot bench the pool. A late failure from a request that was
+  still using the rejected key is retried on the replacement instead. 403 is not treated as a rejected key (it usually means
   the key may not use that model or region). Auth failures at any other time, or of a key
   the guard did not install, are left to DSH.
 - **In-memory budget, cooldowns and log.** Attempt counters, key cooldowns and the 200-entry
   log ring are per process and reset when the plugin reloads or the app restarts. Key
   cooldowns store a SHA-256 fingerprint, never the key. The durable report is the
   `llm/retry` event in the session.
+- **No live status on the settings page.** DSH fixes the host capabilities a client can call
+  at build time, so a third-party plugin cannot feed its runtime state to its settings
+  page. Key status is shown by `/ratelimit-log` instead.
 - **Rotation is global.** The target reference is shared, so a rotation affects every
   session that reads it, which is also why rotations are serialized.
 - **A retry is a new request.** Waiting keeps the conversation and generated context, but
@@ -231,7 +242,7 @@ very next request.
 | --- | --- |
 | Settings page says the config was not found | Plugin enabled in this profile? Restart the app and reopen Settings. |
 | No wait happened | Is the provider covered by `guardedProviders`? Was the failure code one of `RATE_LIMIT`/`HTTP_429`/`QUOTA`/`ACCOUNT_QUOTA`? |
-| No rotation happened | Are alternates configured with values different from the current one? Is the provider excluded (`provider=-`, `deepseek-account`)? Is the `credentials` service enabled in this profile? Are all keys cooling down (`/ratelimit-log` shows the count)? |
+| No rotation happened | Are alternates configured with values different from the current one? Is the provider excluded (`provider=-`, `deepseek-account`)? Is the `credentials` service enabled in this profile? Are all keys cooling down (`/ratelimit-log` lists each key's state)? Does the log say the rotation was refused because the backup references are full or unreadable? |
 | Want the original key back | It is stored in `<REF>_RLG_ORIGINAL`; it rejoins the rotation automatically, or copy it back on the settings page. |
 | Save fails | Settings document is read-only, or someone edited it concurrently — click reload and save again. |
 | `/ratelimit-log` is unknown | Host half not loaded; reinstall/re-enable the bundle. |
@@ -307,7 +318,8 @@ The suites stub only what the plugin touches (`ctx.on`, `ctx.inject`, `ctx.crede
 日志缓存在内存中（冷却只记录密钥指纹），插件重载后清空。不读取 API Key 的提供方
 （本地模型、固定请求头）需要在「按提供方映射」里写成 `提供方=-`，否则轮换模式会对它
 白白改写默认引用；轮换刚换上的密钥如果被服务端拒绝（401），会被暂停使用并换下
-一个（仅 401，403 不算）。无界面（headless）profile 默认不启用凭据服务，轮换不可用，会回退为等待。
+一个（仅 401，403 不算）。同一步骤累计等待超过 60 分钟（可配置）后不再等待；
+`/ratelimit-log` 会显示各密钥的状态，日志语言可在设置页选择中文或英文。无界面（headless）profile 默认不启用凭据服务，轮换不可用，会回退为等待。
 
 安装：把仓库目录放在固定位置，在插件管理中选择该目录安装 bundle，重启应用后在设置页
 配置。密钥只通过 DSH 凭据服务保存，设置页仅保存引用名称并显示掩码。

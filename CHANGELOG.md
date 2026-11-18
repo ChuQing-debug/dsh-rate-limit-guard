@@ -2,7 +2,9 @@
 
 ## 0.3.0
 
-Verified against DeepSeek Harness 0.2.2-rc.1 (headless profile, mock OpenAI-compatible endpoint).
+Verified against DeepSeek Harness 0.2.2-rc.3 (headless and web profiles in an isolated
+`DSH_HOME`, mock OpenAI-compatible endpoint), including the settings page, `/ratelimit-log`
+and the countdown row.
 
 ### Fixed
 - Rotate mode no longer overwrites and loses the original key: it is backed up to
@@ -16,9 +18,10 @@ Verified against DeepSeek Harness 0.2.2-rc.1 (headless profile, mock OpenAI-comp
 - Providers without an API key are not rotated: `deepseek-account` automatically, others
   with `provider=-` under Provider mapping.
 - A pool key rejected right after it was installed (`AUTH` / 401) is benched and replaced
-  instead of failing every later request (at most two keys per rotation; 403 is ignored).
-- The first backed-up key is never overwritten; a later unknown key is saved to
-  `<REF>_RLG_PREVIOUS`. A target reference that cannot be read is not overwritten.
+  instead of failing every later request (benched for an hour, at most two keys of a reference per ten minutes; 403 is ignored).
+- No rotation ever overwrites a key that is stored nowhere else: the first unknown key is
+  saved to `<REF>_RLG_ORIGINAL`, a later one to `<REF>_RLG_PREVIOUS`, and when both are
+  taken, or a backup or the target cannot be read, the rotation is refused.
 - Waits and cooldowns have a one-second floor (`minWaitSeconds`), so millisecond hints do
   not turn into a burst of retries.
 - Exhausted quota (`QUOTA`, `ACCOUNT_QUOTA`) is no longer waited out by default.
@@ -28,8 +31,13 @@ Verified against DeepSeek Harness 0.2.2-rc.1 (headless profile, mock OpenAI-comp
 
 ### Added
 - Wait hints in Chinese and compound durations (`请在 30 秒后重试`, `请等待 30 秒`, `1m30s`),
-  plus `retry in 34.5s`, `retryDelay: "34s"`, `resets after 20s`.
-- Options: `keepOriginalKey`, `quotaCooldownMinutes`, `waitOnQuota`, `jitter`.
+  plus `retry in 34.5s`, `retryDelay: "34s"`, `resets after 20s`, `try again after 20s`, and
+  gateway messages such as `holding sends until 2026-11-18T11:11:52Z (~9s, …)`.
+- Options: `keepOriginalKey`, `quotaCooldownMinutes`, `waitOnQuota`, `jitter`,
+  `maxTotalWaitMinutes`, `language`, `minWaitSeconds`.
+- A per-step total wait budget (default 60 minutes; the old worst case was 12 × 15 minutes).
+- `/ratelimit-log` shows which pool key each target holds and which keys are ready, cooling
+  or rejected; log notes and the report are available in English.
 - Reference-name validation in the host and on the settings page.
 - `node:test` suites and CI.
 

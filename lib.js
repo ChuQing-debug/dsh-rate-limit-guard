@@ -31,8 +31,14 @@ export function isRateLimitFailure(failure) {
 export function isAuthFailure(failure) {
   if (!failure) return false
   const code = typeof failure.code === 'string' ? failure.code : ''
+  // DSH reports both 401 and 403 as AUTH and may leave `status` unset; its message then starts with
+  // the HTTP status ("403: {...}"), which is the only place the two can be told apart.
+  const status = typeof failure.status === 'number'
+    ? failure.status
+    : Number(/^\s*(\d{3})\b/.exec(typeof failure.message === 'string' ? failure.message : '')?.[1])
+  if (status === 403 || code === 'HTTP_403') return false
   if (code === 'AUTH' || code === 'INVALID_CREDENTIAL' || code === 'HTTP_401') return true
-  return failure.status === 401
+  return status === 401
 }
 
 /** Providers that sign in with an account instead of reading an API key: nothing to rotate. */
@@ -107,30 +113,45 @@ export function parseDuration(text) {
   return found && total > 0 ? total : undefined
 }
 
-// Each entry: [pattern, how to read capture 1]. First match wins.
+const ISO_TIME = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})`
+
+/** "until 2026-11-18T11:11:52.150Z": the wait is the distance from now, if that is a sane future time. */
+function untilTimestamp(text, now) {
+  const ms = Date.parse(text) - now
+  return ms > 0 && ms <= 86_400_000 ? ms : undefined
+}
+
+// Each entry: [pattern, how to read capture 1 (text, now)]. First match wins.
 const HINT_PATTERNS = [
+  // "holding sends until 2026-11-18T11:11:52.150Z (~9s, exponential backoff)": a gateway that says
+  // how long it will hold. The relative "(~9s" is preferred, since it does not depend on our clock.
+  [new RegExp(String.raw`\(\s*~\s*(${UNITED})`, 'i'), parseDuration],
+  [new RegExp(String.raw`\b(?:until|till)\s+(${ISO_TIME})`, 'i'), untilTimestamp],
   // "retry_after_ms": 1500, "retry-after-ms: 250": the number is milliseconds.
   [new RegExp(String.raw`retry[-_ ]?after[-_ ]?ms[^0-9]{0,12}(${NUMBER})`, 'i'), (text) => Number(text)],
-  // "retry after 30s", "Retry-After: 12": the one phrasing where a bare number means seconds.
-  [new RegExp(String.raw`retry[-_ ]?after(?![-_ ]?ms)[^0-9]{0,12}(${UNITED}|${BARE})`, 'i'), parseDuration],
+  // "retry after 30s", "try again after 20 seconds".
+  [new RegExp(String.raw`(?:retry|try again)[-_ ]?after(?![-_ ]?ms)[^0-9]{0,12}(${UNITED})`, 'i'), parseDuration],
+  // "Retry-After: 12", "retry after 30": the one phrasing where a bare number means seconds. Only
+  // directly after the words (not "retry after (429)"), and not an epoch timestamp.
+  [new RegExp(String.raw`retry[-_ ]?after(?![-_ ]?ms)["']?[\s:=]{0,4}["']?(${BARE})`, 'i'), (text) => (Number(text) <= 86_400 ? parseDuration(text) : undefined)],
   // "try again in 1m30s", "retry in 34.5s", "resets in 20 seconds", "resets after 20s",
   // "available in 5 seconds", "wait 1 minute", "retryDelay":"34s".
   // These need a unit: "please wait (429)" and "resets in 3 requests" are not durations.
-  // \bwait\b: "request waited 30s in queue" is not a hint.
-  [new RegExp(String.raw`(?:try again in|retry in|retry[-_ ]?delay|resets? (?:in|after)|available in|\bwait(?:ing)?\b(?: for)?)[^0-9]{0,12}(${UNITED})`, 'i'), parseDuration],
+  // \bwait\b: "request waited 30s in queue" and "timed out waiting 30s for upstream" are not hints.
+  [new RegExp(String.raw`(?:try again in|retry in|retry[-_ ]?delay|resets? (?:in|after)|available in|\bwait\b(?: for)?)[^0-9]{0,12}(${UNITED})`, 'i'), parseDuration],
   // Chinese: "请在 30 秒后重试", "请 1 分钟后再试", "1分30秒后重试", "请于1分钟后再发起请求"
-  [new RegExp(String.raw`(${UNITED})\s*(?:之?后|以后)[^0-9]{0,6}(?:重试|再|恢复|继续)`, 'i'), parseDuration],
-  // "请等待 30 秒"
-  [new RegExp(String.raw`等待\s*(${UNITED})`, 'i'), parseDuration],
+  [new RegExp(String.raw`(${UNITED})\s*(?:之?后|以后)[^0-9]{0,6}(?:重试|重新|再|恢复|继续)`, 'i'), parseDuration],
+  // "请等待 30 秒", "请稍等 30 秒"
+  [new RegExp(String.raw`(?:等待|稍等)\s*(${UNITED})`, 'i'), parseDuration],
 ]
 
-/** Best-effort wait hint (ms) from a provider message. */
-export function parseRetryHint(message) {
+/** Best-effort wait hint (ms) from a provider message. `now` only matters for absolute timestamps. */
+export function parseRetryHint(message, now = Date.now()) {
   if (typeof message !== 'string' || message.length === 0) return undefined
   for (const [pattern, read] of HINT_PATTERNS) {
     const match = pattern.exec(message)
     if (!match) continue
-    const ms = read(match[1])
+    const ms = read(match[1], now)
     if (Number.isFinite(ms) && ms > 0) return ms
   }
   return undefined

@@ -97,6 +97,9 @@ test('isAuthFailure recognises credential rejections only', () => {
   assert.ok(isAuthFailure({ code: 'HTTP_401' }))
   assert.ok(isAuthFailure({ code: 'X', status: 401 }))
   assert.ok(!isAuthFailure({ code: 'HTTP_403', status: 403 }), '403 is about permissions, not the key')
+  // shapes seen from a real DSH: code AUTH for both, status only in the message
+  assert.ok(isAuthFailure({ code: 'AUTH', message: '401: {"message":"Invalid API key"}' }))
+  assert.ok(!isAuthFailure({ code: 'AUTH', message: '403: {"message":"model not allowed in your region"}' }))
   assert.ok(!isAuthFailure({ code: 'RATE_LIMIT' }))
   assert.ok(!isAuthFailure(undefined))
 })
@@ -118,4 +121,31 @@ test('computeDelay raises tiny hints to the floor', () => {
   assert.equal(computeDelay({ message: 'Please try again in 6ms' }, cfg).delayMs, 1000)
   assert.equal(computeDelay({ providerRetryAfterMs: 0.3 }, cfg).delayMs, 1000)
   assert.equal(computeDelay({ message: 'Please try again in 6ms' }, { ...cfg, minWaitSeconds: 0 }).delayMs, 6)
+})
+
+test('parseRetryHint: second review round', () => {
+  assert.equal(parseRetryHint('please try again after 1 seconds'), 1000)
+  assert.equal(parseRetryHint('Please try again after 20s'), 20_000)
+  assert.equal(parseRetryHint('请在30秒之后重新请求'), 30_000)
+  assert.equal(parseRetryHint('30秒后重新尝试'), 30_000)
+  assert.equal(parseRetryHint('请稍等 30 秒'), 30_000)
+  assert.equal(parseRetryHint('retry after (429)'), undefined)
+  assert.equal(parseRetryHint('Retry after 1731900000'), undefined)
+  assert.equal(parseRetryHint('Timed out waiting 30s for upstream'), undefined)
+  assert.equal(parseRetryHint('Retry-After: 12'), 12_000)
+  assert.equal(parseRetryHint('"retry_after": 30'), 30_000)
+  assert.equal(parseRetryHint('retry after 30'), 30_000)
+})
+
+test('parseRetryHint reads gateway "holding until <time> (~9s)" messages', () => {
+  const real = '429: {"type":"rate_limit_error","code":"bili_throttle_hold","stage":"forward","message":"upstream rate-limited 1 consecutive request(s) to discovery-api.intern-ai.org.cn; bili is holding outbound sends until 2026-11-18T11:11:52.150Z (~9s, exponential backoff) instead of amplifying — zero egress while held, auto-resumes when the limit clears (#4204)","retryable":true}'
+  assert.equal(parseRetryHint(real), 9000)
+  // without the relative part, the timestamp is used against the given clock
+  const now = Date.parse('2026-11-18T11:11:40.000Z')
+  assert.equal(parseRetryHint('holding sends until 2026-11-18T11:11:52.000Z', now), 12_000)
+  assert.equal(parseRetryHint('blocked until 2026-11-18T19:11:52+08:00', now), 12_000)
+  // a time in the past, or more than a day away, is not a usable hint
+  assert.equal(parseRetryHint('holding sends until 2026-11-18T11:00:00Z', now), undefined)
+  assert.equal(parseRetryHint('suspended until 2027-01-01T00:00:00Z', now), undefined)
+  assert.equal(parseRetryHint('valid until 2026-11-18'), undefined)
 })

@@ -50,6 +50,11 @@ window.__ModuleLoader__.load({
         waitOnQuotaHint: '默认关闭：QUOTA / ACCOUNT_QUOTA 表示余额或额度用完，等待无法恢复，会直接交回默认处理。',
         maxAttempts: '每步骤最多重试次数',
         maxAttemptsHint: '达到上限后交回默认重试策略，避免无限等待。',
+        maxTotalWaitMinutes: '每步骤累计等待上限（分钟）',
+        maxTotalWaitMinutesHint: '同一步骤的等待时间加起来超过这个值就不再等待，交回默认处理。0 表示不限制。',
+        language: '日志与 /ratelimit-log 的语言',
+        languageHint: '“跟随系统”按运行 DSH 的系统语言选择中文或英文。',
+        languageAuto: '跟随系统',
         keysTitle: '密钥池',
         keysDesc: '密钥值只写入凭据服务，本页保存的是引用名称。轮换会把备用密钥的值写入目标引用，下一个请求立即生效。',
         credentialRef: '目标密钥引用',
@@ -115,6 +120,11 @@ window.__ModuleLoader__.load({
         waitOnQuotaHint: 'Off by default: QUOTA / ACCOUNT_QUOTA means the balance or quota is used up, so waiting cannot help and the failure is handed back.',
         maxAttempts: 'Retries per step',
         maxAttemptsHint: 'After this cap the ordinary retry policy takes over.',
+        maxTotalWaitMinutes: 'Total wait per step (minutes)',
+        maxTotalWaitMinutesHint: 'Once the waits of one step add up to more than this, the guard stops waiting and hands the failure back. 0 means no limit.',
+        language: 'Language of the log and /ratelimit-log',
+        languageHint: '"Follow system" picks Chinese or English from the locale of the machine running DSH.',
+        languageAuto: 'Follow system',
         keysTitle: 'Key pool',
         keysDesc: 'Key values go to the credentials service only; this page stores reference names. Rotation writes a pool value into the target reference and the next request uses it.',
         credentialRef: 'Target credential reference',
@@ -258,6 +268,8 @@ window.__ModuleLoader__.load({
         useRetryAfter: v.useRetryAfter !== false,
         maxWaitSeconds: String(v.maxWaitSeconds ?? 900),
         maxAttempts: String(v.maxAttempts ?? 12),
+        maxTotalWaitMinutes: String(v.maxTotalWaitMinutes ?? 60),
+        language: v.language === 'zh' || v.language === 'en' ? v.language : 'auto',
         credentialRef: String(v.credentialRef ?? 'DEEPSEEK_API_KEY'),
         alternateKeyRefs: Array.isArray(v.alternateKeyRefs) ? v.alternateKeyRefs.join('\n') : '',
         providerRefs: Array.isArray(v.providerRefs) ? v.providerRefs.join('\n') : '',
@@ -271,6 +283,8 @@ window.__ModuleLoader__.load({
     }
 
     function numberOr(value, fallback, min, max) {
+      // A blank field means "use the default", not 0 (0 switches some limits off).
+      if (String(value ?? '').trim() === '') return fallback
       const parsed = Number(value)
       if (!Number.isFinite(parsed)) return fallback
       return Math.min(Math.max(Math.round(parsed), min), max)
@@ -283,6 +297,8 @@ window.__ModuleLoader__.load({
         { op: 'set', path: ['useRetryAfter'], value: draft.useRetryAfter === true },
         { op: 'set', path: ['maxWaitSeconds'], value: numberOr(draft.maxWaitSeconds, 900, 1, 86400) },
         { op: 'set', path: ['maxAttempts'], value: numberOr(draft.maxAttempts, 12, 1, 100) },
+        { op: 'set', path: ['maxTotalWaitMinutes'], value: numberOr(draft.maxTotalWaitMinutes, 60, 0, 10080) },
+        { op: 'set', path: ['language'], value: draft.language },
         { op: 'set', path: ['credentialRef'], value: String(draft.credentialRef ?? '').trim() || 'DEEPSEEK_API_KEY' },
         { op: 'set', path: ['alternateKeyRefs'], value: splitList(draft.alternateKeyRefs) },
         { op: 'set', path: ['providerRefs'], value: splitList(draft.providerRefs) },
@@ -591,6 +607,17 @@ window.__ModuleLoader__.load({
 
         h(Card, { title: t('advancedTitle'), desc: t('advancedDesc') },
           h(Row, { label: t('maxAttempts'), hint: t('maxAttemptsHint') }, numberInput('maxAttempts', 1, 100)),
+          h(Row, { label: t('maxTotalWaitMinutes'), hint: t('maxTotalWaitMinutesHint') }, numberInput('maxTotalWaitMinutes', 0, 10080)),
+          h(Row, { label: t('language'), hint: t('languageHint') },
+            h('select', {
+              className: 'rlg-input',
+              value: draft.language,
+              disabled: !writable,
+              onChange: (event) => update({ language: event.target.value }),
+            },
+              h('option', { value: 'auto' }, t('languageAuto')),
+              h('option', { value: 'zh' }, '中文'),
+              h('option', { value: 'en' }, 'English'))),
           h(Row, { label: t('guardedProviders'), hint: t('guardedProvidersHint') },
             h('textarea', {
               className: 'rlg-textarea',

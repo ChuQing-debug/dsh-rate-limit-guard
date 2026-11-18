@@ -142,7 +142,7 @@ test('saving rejects invalid reference names and writes the new fields otherwise
   await saveButton.props.onClick()
   assert.equal(good.mutations.length, 1)
   const paths = good.mutations[0].map((op) => op.path[0])
-  for (const field of ['jitter', 'waitOnQuota', 'quotaCooldownMinutes', 'keepOriginalKey']) assert.ok(paths.includes(field), field)
+  for (const field of ['jitter', 'waitOnQuota', 'quotaCooldownMinutes', 'keepOriginalKey', 'maxTotalWaitMinutes', 'language']) assert.ok(paths.includes(field), field)
 })
 
 test('saving accepts "provider=-" as a no-rotation mapping', async () => {
