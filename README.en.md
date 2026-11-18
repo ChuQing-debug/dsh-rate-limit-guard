@@ -189,7 +189,7 @@ npm test        # all tests, on node:test, no dependencies
 ```
 
 - How it works and why: [docs/DESIGN.md](docs/DESIGN.md) (Chinese).
-- Version history: [CHANGELOG.md](CHANGELOG.md).
+- Version history: [English](CHANGELOG.en.md) · [中文](CHANGELOG.md).
 - The in-app help page is [docs/DETAIL.md](docs/DETAIL.md) (Chinese).
 
 ## License

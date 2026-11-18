@@ -224,7 +224,7 @@ npm test        # 全部测试（node:test），当前 67 项
 
 - 测试覆盖等待时长解析、离线/中止、备份与轮换、冷却、并发轮换、日志输出等。
 - CI：Node 22 / 24，见 [.github/workflows/test.yml](.github/workflows/test.yml)。
-- 设计文档 [docs/DESIGN.md](docs/DESIGN.md)，版本记录 [CHANGELOG.md](CHANGELOG.md)，应用内说明 [docs/DETAIL.md](docs/DETAIL.md)。
+- 设计文档 [docs/DESIGN.md](docs/DESIGN.md)，版本记录 [中文](CHANGELOG.md) / [English](CHANGELOG.en.md)，应用内说明 [docs/DETAIL.md](docs/DETAIL.md)。
 
 ## 目录结构
 
@@ -232,7 +232,8 @@ npm test        # 全部测试（node:test），当前 67 项
 dsh-rate-limit-guard/
 ├── README.md           # 中文说明（GitHub 首页）
 ├── README.en.md        # English README
-├── CHANGELOG.md        # 版本记录
+├── CHANGELOG.md        # 版本记录（中文）
+├── CHANGELOG.en.md     # 版本记录（English）
 ├── LICENSE             # MIT
 ├── SECURITY.md         # 漏洞报告方式
 ├── index.js            # 主机端插件：监听限额失败、等待、轮换、命令注册
