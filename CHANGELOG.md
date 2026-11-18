@@ -19,10 +19,15 @@ and the countdown row.
   with `provider=-` under Provider mapping.
 - A pool key rejected right after it was installed (`AUTH` / 401) is benched and replaced
   instead of failing every later request (benched for an hour, at most two keys of a reference per ten minutes; 403 is ignored).
+  When that limit is hit the guard stops benching and puts the original key back, so a
+  rejected key is not left installed.
 - No rotation ever overwrites a key that is stored nowhere else: the first unknown key is
   saved to `<REF>_RLG_ORIGINAL`, a later one to `<REF>_RLG_PREVIOUS`, and when both are
-  taken, or a backup or the target cannot be read, the rotation is refused.
-- Waits and cooldowns have a one-second floor (`minWaitSeconds`), so millisecond hints do
+  taken, or a backup or the target cannot be read, or the target changed while the
+  rotation was running, the rotation is refused. Rotations of all targets run one at a
+  time, and a target reference is never used as another target's pool key.
+- Waits and cooldowns have a one-second floor (`minWaitSeconds`; the last wait of a
+  step's total budget may be shorter), so millisecond hints do
   not turn into a burst of retries.
 - Exhausted quota (`QUOTA`, `ACCOUNT_QUOTA`) is no longer waited out by default.
 - Wait hints: status codes, dates and counts are no longer read as seconds

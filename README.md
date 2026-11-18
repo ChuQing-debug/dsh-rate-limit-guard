@@ -230,7 +230,9 @@ very next request.
   at build time, so a third-party plugin cannot feed its runtime state to its settings
   page. Key status is shown by `/ratelimit-log` instead.
 - **Rotation is global.** The target reference is shared, so a rotation affects every
-  session that reads it, which is also why rotations are serialized.
+  session that reads it, which is also why rotations are serialized (across all targets).
+  A reference that is some provider's target is never used as a pool key, even if it is
+  listed under the alternates.
 - **A retry is a new request.** Waiting keeps the conversation and generated context, but
   the failed attempt itself is not resumed mid-stream.
 - **One wait at a time per step.** Aborting the session (or unloading the plugin) cancels a
@@ -319,7 +321,11 @@ The suites stub only what the plugin touches (`ctx.on`, `ctx.inject`, `ctx.crede
 （本地模型、固定请求头）需要在「按提供方映射」里写成 `提供方=-`，否则轮换模式会对它
 白白改写默认引用；轮换刚换上的密钥如果被服务端拒绝（401），会被暂停使用并换下
 一个（仅 401，403 不算）。同一步骤累计等待超过 60 分钟（可配置）后不再等待；
-`/ratelimit-log` 会显示各密钥的状态，日志语言可在设置页选择中文或英文。无界面（headless）profile 默认不启用凭据服务，轮换不可用，会回退为等待。
+`/ratelimit-log` 会显示各密钥的状态，日志语言可在设置页选择中文或英文。
+
+原密钥备份在 `<引用>_RLG_ORIGINAL`，之后出现的未知密钥备份在 `<引用>_RLG_PREVIOUS`；两个
+备份都不会被覆盖，都占用时插件拒绝轮换、改为等待，直到你清理其中一个或把新密钥加入
+密钥池。无界面（headless）profile 默认不启用凭据服务，轮换不可用，会回退为等待。
 
 安装：把仓库目录放在固定位置，在插件管理中选择该目录安装 bundle，重启应用后在设置页
 配置。密钥只通过 DSH 凭据服务保存，设置页仅保存引用名称并显示掩码。

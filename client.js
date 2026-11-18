@@ -62,7 +62,7 @@ window.__ModuleLoader__.load({
         alternates: '备用密钥引用',
         alternatesHint: '每行一个。按顺序轮流使用，跳过正在冷却（刚被限流）的密钥。',
         keepOriginalKey: '轮换前备份原密钥',
-        keepOriginalKeyHint: '第一次换走不在池中的密钥时，把它保存到 <目标引用>_RLG_ORIGINAL，并让它参与后续轮换，原密钥不会丢失。',
+        keepOriginalKeyHint: '第一次换走不在池中的密钥时，把它保存到 <目标引用>_RLG_ORIGINAL，并让它参与后续轮换；之后再出现的未知密钥保存到 <目标引用>_RLG_PREVIOUS。两个备份都不会被覆盖，都占用时不再轮换、改为等待，需要你清理其中一个或把新密钥加入密钥池。',
         quotaCooldownMinutes: '额度耗尽的密钥冷却（分钟）',
         quotaCooldownMinutesHint: 'QUOTA / ACCOUNT_QUOTA 的密钥在这段时间内不会再被选中。',
         invalidRefs: '引用名称只能包含字母、数字和下划线，且不能以数字开头',
@@ -132,7 +132,7 @@ window.__ModuleLoader__.load({
         alternates: 'Pool references',
         alternatesHint: 'One per line. Keys are used in turn; keys still cooling down after a limit are skipped.',
         keepOriginalKey: 'Back up the original key before rotating',
-        keepOriginalKeyHint: 'The first time a key outside the pool is rotated away, it is saved to <target>_RLG_ORIGINAL and joins the rotation, so it is never lost.',
+        keepOriginalKeyHint: 'The first time a key outside the pool is rotated away, it is saved to <target>_RLG_ORIGINAL and joins the rotation; a later unknown key goes to <target>_RLG_PREVIOUS. Neither backup is ever overwritten: when both are taken the guard stops rotating and waits, until you clear one or add the new key to the pool.',
         quotaCooldownMinutes: 'Cooldown for exhausted keys (minutes)',
         quotaCooldownMinutesHint: 'A key that returned QUOTA / ACCOUNT_QUOTA is not picked again for this long.',
         invalidRefs: 'Reference names may only contain letters, digits and underscores, and must not start with a digit',
@@ -248,15 +248,25 @@ window.__ModuleLoader__.load({
       const push = (ref) => {
         if (typeof ref === 'string' && ref.trim() !== '' && !out.includes(ref.trim())) out.push(ref.trim())
       }
-      push(value.credentialRef)
-      if (value.keepOriginalKey && typeof value.credentialRef === 'string' && value.credentialRef.trim() !== '') {
-        push(`${value.credentialRef.trim()}_RLG_ORIGINAL`)
+      // every target (default + mapped) with its two backup slots, then the alternates
+      const targets = []
+      const target = (ref) => {
+        const name = typeof ref === 'string' ? ref.trim() : ''
+        if (name !== '' && !targets.includes(name)) targets.push(name)
       }
-      for (const ref of splitList(value.alternateKeyRefs)) push(ref)
+      target(value.credentialRef)
       for (const mapping of splitList(value.providerRefs)) {
         const separator = mapping.indexOf('=')
-        if (separator > 0 && !isNoRotate(mapping.slice(separator + 1).trim())) push(mapping.slice(separator + 1))
+        if (separator > 0 && !isNoRotate(mapping.slice(separator + 1).trim())) target(mapping.slice(separator + 1))
       }
+      for (const name of targets) {
+        push(name)
+        if (value.keepOriginalKey) {
+          push(`${name}_RLG_ORIGINAL`)
+          push(`${name}_RLG_PREVIOUS`)
+        }
+      }
+      for (const ref of splitList(value.alternateKeyRefs)) push(ref)
       return out
     }
 
@@ -287,7 +297,9 @@ window.__ModuleLoader__.load({
       if (String(value ?? '').trim() === '') return fallback
       const parsed = Number(value)
       if (!Number.isFinite(parsed)) return fallback
-      return Math.min(Math.max(Math.round(parsed), min), max)
+      // Never round a small positive value down to 0: 0 means "no limit" for some fields.
+      const rounded = parsed > 0 ? Math.max(1, Math.round(parsed)) : Math.round(parsed)
+      return Math.min(Math.max(rounded, min), max)
     }
 
     function buildOps(draft) {

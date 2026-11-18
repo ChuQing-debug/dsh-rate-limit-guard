@@ -149,3 +149,29 @@ test('parseRetryHint reads gateway "holding until <time> (~9s)" messages', () =>
   assert.equal(parseRetryHint('suspended until 2027-01-01T00:00:00Z', now), undefined)
   assert.equal(parseRetryHint('valid until 2026-11-18'), undefined)
 })
+
+test('parseRetryHint: third review round', () => {
+  const now = Date.parse('2026-11-18T11:00:00Z')
+  for (const message of [
+    'Your trial is valid until 2026-11-18T23:59:59Z',
+    'rate limit (~30s window, 10 requests)',
+    'slow upstream (~5m average latency)',
+    'max wait 30s exceeded',
+    'gave up after wait of 120s',
+    'retry after 429',
+    'no retry after 5',
+    '已等待 30 秒仍未获得配额',
+  ]) assert.equal(parseRetryHint(message, now), undefined, message)
+  assert.equal(parseRetryHint('x-ratelimit-reset-tokens: 6m0s'), 360_000)
+  assert.equal(parseRetryHint('requests are throttled until 2026-11-18T11:00:20Z', now), 20_000)
+  assert.equal(parseRetryHint('retry after 30'), 30_000)
+  assert.equal(parseRetryHint('Retry-After: 12'), 12_000)
+  assert.equal(parseRetryHint('please wait 20 seconds'), 20_000)
+  assert.equal(parseRetryHint('请等待 30 秒'), 30_000)
+})
+
+test('isAuthFailure: 403 in other shapes is still not a rejected key', () => {
+  assert.ok(!isAuthFailure({ code: 'AUTH', message: 'HTTP 403 Forbidden: model not allowed' }))
+  assert.ok(!isAuthFailure({ code: 'AUTH', status: '403', message: 'forbidden' }))
+  assert.ok(isAuthFailure({ code: 'AUTH', message: 'HTTP 401 Unauthorized' }))
+})

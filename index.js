@@ -382,6 +382,7 @@ export function apply(ctx, config = {}) {
             : L(`冷却到 ${untilTime(until)}`, `cooling until ${untilTime(until)}`)
         lines.push(`    ${entry.ref}: ${state}`)
       }
+      for (const slot of pool.unreadable) lines.push(`    ${slot}: ${L('读取失败', 'unreadable')}`)
       if (pool.length === 0) lines.push(L('    （密钥池为空）', '    (the pool is empty)'))
     }
     return lines
@@ -460,15 +461,30 @@ export function apply(ctx, config = {}) {
   }
 
   /** Run `task` after every earlier rotation of the same ref has finished. */
-  function withLock(ref, task) {
-    const previous = locks.get(ref) ?? Promise.resolve()
+  function withLock(_ref, task) {
+    // One chain for every target: targets can share pool keys, so two rotations must never interleave.
+    const key = '*'
+    const previous = locks.get(key) ?? Promise.resolve()
     const run = previous.then(task, task)
     const tail = run.then(() => undefined, () => undefined)
-    locks.set(ref, tail)
+    locks.set(key, tail)
     tail.then(() => {
-      if (locks.get(ref) === tail) locks.delete(ref)
+      if (locks.get(key) === tail) locks.delete(key)
     })
     return run
+  }
+
+  /**
+   * Write `value` into the target, but only if it still holds the key we read at the start of this
+   * rotation. A key typed in meanwhile (settings page, another tool) is never overwritten.
+   */
+  async function writeTarget(ref, value, expectedFp) {
+    const check = await readTarget(ref)
+    const fp = check.ok && check.value !== undefined ? fingerprint(check.value) : undefined
+    if (!check.ok || fp !== expectedFp) {
+      throw new Error(L(`${ref} 在轮换过程中被修改或无法读取`, `${ref} changed or became unreadable during the rotation`))
+    }
+    await credentials.set(ref, value)
   }
 
   async function resolveValue(ref) {
@@ -501,7 +517,8 @@ export function apply(ctx, config = {}) {
   async function loadPool(cfg, ref) {
     const slots = cfg.keepOriginalKey ? [backupRefFor(ref), previousRefFor(ref)] : []
     const refs = [...slots]
-    for (const alt of cfg.alternateKeyRefs) if (alt !== ref && !refs.includes(alt)) refs.push(alt)
+    const targets = targetRefs(cfg)
+    for (const alt of cfg.alternateKeyRefs) if (!targets.includes(alt) && !refs.includes(alt)) refs.push(alt)
     const pool = []
     pool.unreadable = []
     for (const poolRef of refs) {
@@ -573,7 +590,7 @@ export function apply(ctx, config = {}) {
         return { ok: false, reason: L('密钥池中的密钥都在冷却中', 'every key in the pool is cooling down'), readyAt: choice.readyAt }
       }
       try {
-        await credentials.set(ref, choice.pick.value)
+        await writeTarget(ref, choice.pick.value, currentFp)
       } catch (error) {
         return { ok: false, reason: L(`无法写入 ${ref}: ${messageOf(error)}`, `cannot write ${ref}: ${messageOf(error)}`) }
       }
@@ -607,11 +624,26 @@ export function apply(ctx, config = {}) {
         state.graceFor = last.id
         return { handled: true, raced: true }
       }
+      const isBackup = (name) => name === backupRefFor(ref) || name === previousRefFor(ref)
       const recent = (rejectTimes.get(ref) ?? []).filter((at) => now - at < REJECT_LIMIT_WINDOW_MS)
-      if (recent.length >= MAX_REJECTS_PER_WINDOW) return { handled: false }
       const pool = await loadPool(cfg, ref)
       const rejected = pool.find((entry) => entry.fp === currentFp)
       if (!rejected) return { handled: false }
+      if (recent.length >= MAX_REJECTS_PER_WINDOW) {
+        // Too many rejections in a row to keep blaming keys. Do not bench this one, but do not leave
+        // it installed either: park a key that was not rejected (the user's own, if it is there).
+        const park = pool
+          .filter((entry) => entry.fp !== currentFp && !rejectedFps.has(entry.fp))
+          .sort((a, b) => Number(isBackup(b.ref)) - Number(isBackup(a.ref)) || (cooldowns.get(a.fp) ?? 0) - (cooldowns.get(b.fp) ?? 0))[0]
+        lastRotation.delete(ref)
+        if (!park) return { handled: false }
+        try {
+          await writeTarget(ref, park.value, currentFp)
+        } catch {
+          return { handled: false }
+        }
+        return { handled: true, limited: true, rejectedRef: rejected.ref, keyRef: park.ref }
+      }
       cooldowns.set(currentFp, now + REJECTED_KEY_COOLDOWN_MS)
       rejectedFps.add(currentFp)
       rejectTimes.set(ref, [...recent, now])
@@ -622,7 +654,7 @@ export function apply(ctx, config = {}) {
         .sort((a, b) => (cooldowns.get(a.fp) ?? 0) - (cooldowns.get(b.fp) ?? 0))[0]
       if (!pick) return { handled: true, rejectedRef: rejected.ref }
       try {
-        await credentials.set(ref, pick.value)
+        await writeTarget(ref, pick.value, currentFp)
       } catch {
         return { handled: true, rejectedRef: rejected.ref }
       }
@@ -651,7 +683,7 @@ export function apply(ctx, config = {}) {
       const choice = pickNext(pool, currentFp, cooldowns, now)
       if (!choice.pick) return undefined
       try {
-        await credentials.set(ref, choice.pick.value)
+        await writeTarget(ref, choice.pick.value, currentFp)
         noteRotation(ref, choice.pick.fp, provider, state)
         return choice.pick.ref
       } catch {
@@ -777,6 +809,19 @@ export function apply(ctx, config = {}) {
     if (!attempt) return next()
     const outcome = await replaceRejected(cfg, ref, attempt.state, provider)
     if (!outcome.handled) return next()
+    if (outcome.limited) {
+      record('warn', {
+        action: 'key-rejected',
+        provider,
+        code: failure.code,
+        retry: attempt.retry,
+        note: L(
+          `短时间内已有多个密钥被拒绝，问题可能不在密钥本身；不再暂停密钥，已把 ${ref} 换回 ${outcome.keyRef}，交回后续处理器`,
+          `several keys were rejected in a short time, so the keys are probably not the cause; benching stopped, ${ref} switched back to ${outcome.keyRef}, handing back`,
+        ),
+      })
+      return next()
+    }
     if (outcome.raced) {
       record('info', { action: 'rotate-raced', provider, retry: attempt.retry, note: L('被拒绝的密钥已被换掉，直接用新密钥重试', 'the rejected key was already replaced, retrying on the new key') })
       appendScheduled(agent, { ...attempt.base, delayMs: 0 })

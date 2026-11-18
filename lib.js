@@ -33,9 +33,10 @@ export function isAuthFailure(failure) {
   const code = typeof failure.code === 'string' ? failure.code : ''
   // DSH reports both 401 and 403 as AUTH and may leave `status` unset; its message then starts with
   // the HTTP status ("403: {...}"), which is the only place the two can be told apart.
-  const status = typeof failure.status === 'number'
-    ? failure.status
-    : Number(/^\s*(\d{3})\b/.exec(typeof failure.message === 'string' ? failure.message : '')?.[1])
+  const given = Number(failure.status)
+  const status = Number.isInteger(given) && given >= 100
+    ? given
+    : Number(/^\s*(?:HTTP\s+)?(\d{3})\b/i.exec(typeof failure.message === 'string' ? failure.message : '')?.[1])
   if (status === 403 || code === 'HTTP_403') return false
   if (code === 'AUTH' || code === 'INVALID_CREDENTIAL' || code === 'HTTP_401') return true
   return status === 401
@@ -113,7 +114,16 @@ export function parseDuration(text) {
   return found && total > 0 ? total : undefined
 }
 
+// Words that say requests are being held back (so a following "until <time>" is a wait hint).
+const HELD = String.raw`\b(?:hold\w*|held|block\w*|paus\w*|throttl\w*|rate[- ]?limit\w*|suspend\w*|retry\w*|wait\w*|resum\w*)`
 const ISO_TIME = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})`
+
+/** A unit-less number after "retry after": seconds, unless it looks like an epoch or an HTTP status. */
+function bareSeconds(text) {
+  const value = Number(text)
+  if (value > 86_400 || (Number.isInteger(value) && value >= 400 && value <= 599)) return undefined
+  return parseDuration(text)
+}
 
 /** "until 2026-11-18T11:11:52.150Z": the wait is the distance from now, if that is a sane future time. */
 function untilTimestamp(text, now) {
@@ -125,24 +135,28 @@ function untilTimestamp(text, now) {
 const HINT_PATTERNS = [
   // "holding sends until 2026-11-18T11:11:52.150Z (~9s, exponential backoff)": a gateway that says
   // how long it will hold. The relative "(~9s" is preferred, since it does not depend on our clock.
-  [new RegExp(String.raw`\(\s*~\s*(${UNITED})`, 'i'), parseDuration],
-  [new RegExp(String.raw`\b(?:until|till)\s+(${ISO_TIME})`, 'i'), untilTimestamp],
+  // Both need a "held until" context: "valid until <date>" and "(~30s window)" are not hints.
+  [new RegExp(String.raw`${HELD}[^.;]{0,60}?\b(?:until|till)\b[^()]{0,60}\(\s*~\s*(${UNITED})`, 'i'), parseDuration],
+  [new RegExp(String.raw`${HELD}[^.;]{0,60}?\b(?:until|till)\s+(${ISO_TIME})`, 'i'), untilTimestamp],
+  // Header-style resets: "x-ratelimit-reset-tokens: 6m0s"
+  [new RegExp(String.raw`ratelimit-reset[-a-z]*["']?\s*[:=]\s*["']?(${UNITED})`, 'i'), parseDuration],
   // "retry_after_ms": 1500, "retry-after-ms: 250": the number is milliseconds.
   [new RegExp(String.raw`retry[-_ ]?after[-_ ]?ms[^0-9]{0,12}(${NUMBER})`, 'i'), (text) => Number(text)],
   // "retry after 30s", "try again after 20 seconds".
   [new RegExp(String.raw`(?:retry|try again)[-_ ]?after(?![-_ ]?ms)[^0-9]{0,12}(${UNITED})`, 'i'), parseDuration],
   // "Retry-After: 12", "retry after 30": the one phrasing where a bare number means seconds. Only
   // directly after the words (not "retry after (429)"), and not an epoch timestamp.
-  [new RegExp(String.raw`retry[-_ ]?after(?![-_ ]?ms)["']?[\s:=]{0,4}["']?(${BARE})`, 'i'), (text) => (Number(text) <= 86_400 ? parseDuration(text) : undefined)],
+  // Not "no retry after 5", and a bare 4xx/5xx is taken for a status code ("retry after 429").
+  [new RegExp(String.raw`(?<!\bno\s)retry[-_ ]?after(?![-_ ]?ms)["']?[\s:=]{0,4}["']?(${BARE})`, 'i'), bareSeconds],
   // "try again in 1m30s", "retry in 34.5s", "resets in 20 seconds", "resets after 20s",
   // "available in 5 seconds", "wait 1 minute", "retryDelay":"34s".
   // These need a unit: "please wait (429)" and "resets in 3 requests" are not durations.
   // \bwait\b: "request waited 30s in queue" and "timed out waiting 30s for upstream" are not hints.
-  [new RegExp(String.raw`(?:try again in|retry in|retry[-_ ]?delay|resets? (?:in|after)|available in|\bwait\b(?: for)?)[^0-9]{0,12}(${UNITED})`, 'i'), parseDuration],
+  [new RegExp(String.raw`(?:try again in|retry in|retry[-_ ]?delay|resets? (?:in|after)|available in|(?<!\bmax\s)(?<!\bmaximum\s)\bwait\b(?!\s+of\b)(?: for)?)[^0-9]{0,12}(${UNITED})`, 'i'), parseDuration],
   // Chinese: "请在 30 秒后重试", "请 1 分钟后再试", "1分30秒后重试", "请于1分钟后再发起请求"
   [new RegExp(String.raw`(${UNITED})\s*(?:之?后|以后)[^0-9]{0,6}(?:重试|重新|再|恢复|继续)`, 'i'), parseDuration],
   // "请等待 30 秒", "请稍等 30 秒"
-  [new RegExp(String.raw`(?:等待|稍等)\s*(${UNITED})`, 'i'), parseDuration],
+  [new RegExp(String.raw`(?:(?<!已)等待|稍等)\s*(${UNITED})`, 'i'), parseDuration],
 ]
 
 /** Best-effort wait hint (ms) from a provider message. `now` only matters for absolute timestamps. */

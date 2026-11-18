@@ -15,7 +15,7 @@ function harness(config = {}, initial = {}) {
       if (failResolve.has(ref)) throw new Error('storage busy')
       return store.has(ref) ? { value: store.get(ref) } : undefined
     },
-    async set(ref, value) { store.set(ref, value) },
+    async set(ref, value) { store.set(ref, value); api.onSet?.(ref, value) },
   }
   const sub = {
     credentials,
@@ -40,7 +40,7 @@ function harness(config = {}, initial = {}) {
   let nextCalls = 0
   const fire = (failure, { step = 1, signal, provider = 'deepseek' } = {}) =>
     listener({ agent, turn: 1, step, provider, failure, signal }, async () => { nextCalls += 1; return undefined })
-  return {
+  const api = {
     store,
     failResolve,
     events,
@@ -49,6 +49,7 @@ function harness(config = {}, initial = {}) {
     log: async () => (await command.handler()).text,
     dispose: () => disposers.forEach((d) => d()),
   }
+  return api
 }
 
 const limited = (message = 'rate limited') => ({ code: 'RATE_LIMIT', message })
@@ -290,7 +291,9 @@ test('an auth failure that follows every key benches at most two keys', async ()
     await h.fire({ code: 'AUTH', message: '401' }, { step: 1 })
     seen.add(h.store.get('DEEPSEEK_API_KEY'))
   }
-  assert.deepEqual([...seen].sort(), ['bbb', 'ccc'], 'aaa and bbb benched, then the guard stops')
+  assert.deepEqual([...seen].sort(), ['bbb', 'ccc', 'orig'], 'aaa and bbb benched, then the guard stops')
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'orig', 'the last rejected key is not left installed: the original is put back')
+  assert.match(await h.log(), /问题可能不在密钥本身/)
   assert.equal(h.store.get('DEEPSEEK_API_KEY_RLG_ORIGINAL'), 'orig')
 })
 
@@ -446,4 +449,26 @@ test('a late auth failure from the old key does not bench the replacement', asyn
   // another step, whose request was still using the revoked key
   assert.deepEqual(await h.fire({ code: 'AUTH', message: '401' }, { step: 2 }), { kind: 'retry' })
   assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'bbb')
+})
+
+test('two targets that list each other as alternates never lose a shared key', async () => {
+  const h = harness(
+    { mode: 'rotate', credentialRef: 'KEY_ONE', providerRefs: ['p2=KEY_TWO'], alternateKeyRefs: ['KEY_ONE', 'KEY_TWO', 'KEY_A'] },
+    { KEY_ONE: 'shared', KEY_TWO: 'shared', KEY_A: 'aaa' },
+  )
+  await Promise.all([h.fire(limited(), { step: 1, provider: 'p1' }), h.fire(limited(), { step: 2, provider: 'p2' })])
+  const values = [...h.store.values()]
+  assert.ok(values.includes('shared'), 'the shared key is still stored somewhere: ' + JSON.stringify([...h.store]))
+})
+
+test('a key typed into the target during a rotation is not overwritten', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A'], fallbackToWait: false },
+    { DEEPSEEK_API_KEY: 'orig', KEY_A: 'aaa' },
+  )
+  // the user saves a new key right after the guard has written the backup, before it writes the target
+  h.onSet = (ref) => { if (ref === 'DEEPSEEK_API_KEY_RLG_ORIGINAL') h.store.set('DEEPSEEK_API_KEY', 'typed-meanwhile') }
+  await h.fire(limited())
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'typed-meanwhile')
+  assert.equal(h.nextCalls(), 1)
 })
