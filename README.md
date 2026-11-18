@@ -1,6 +1,6 @@
 # dsh-rate-limit-guard
 
-![version](https://img.shields.io/badge/version-0.2.1-blue)
+![version](https://img.shields.io/badge/version-0.3.0-blue)
 ![platform](https://img.shields.io/badge/DSH-0.2.2--rc.3%20tested-6f42c1)
 ![language](https://img.shields.io/badge/UI-中文%20%7C%20English-1f6feb)
 
@@ -67,10 +67,11 @@ agent/request-error  ──►  rate-limit-guard (prepended listener)
               ┌───────────────┴───────────────┐
               ▼                               ▼
         wait mode                        rotate mode
-   append llm/retry                 find a different configured
-   sleep (retry-after │ timer)      credential in the pool
+   append llm/retry                 cool down the key that failed
+   sleep (hint │ timer)             next pool key that is not cooling
    append llm/retry-started         credentials.set(target ref, value)
               │                      append llm/retry (delay 0)
+              │                      (all cooling: wait for the first)
               └───────────────┬───────────────┘
                               ▼
                        return { kind: 'retry' }
@@ -91,9 +92,15 @@ one step and resets for the next step or turn. Retrospective data (attempt count
 ## Requirements
 
 - DeepSeek Harness desktop or `dsh web`, tested against **0.2.2-rc.3** (profile `desktop`).
-- A provider configured through a **credential reference** for rotate mode. Account-login
-  providers (for example the desktop default `deepseek-account`) do not read a swappable
-  API key; rotation logs "unable to rotate" and falls back to waiting (configurable).
+- A provider configured through a **credential reference** (`apiKeyEnv`) for rotate mode.
+  DSH does not tell plugins which reference a provider reads, so providers that read no
+  API key must be excluded by hand with `provider=-` under **Provider mapping** (local
+  models, fixed `Authorization` headers). `deepseek-account` is excluded automatically.
+  An excluded provider falls back to waiting (or hands the failure back when
+  `fallbackToWait` is off).
+- Rotate mode needs the `credentials` service. It is on in the desktop and web profiles
+  and **off by default in `headless`**; there the guard logs "credentials 服务不可用" and
+  waits instead, unless the profile enables it (`- id: credentials` / `disabled: false`).
 
 ## Installation
 
@@ -139,13 +146,14 @@ next request. Values can also be supplied in the bundle's patch `config:` block.
 | `useRetryAfter` | `true` | Prefer `providerRetryAfterMs`, then a delay parsed from the error message (e.g. `retry after 30s`), then `waitSeconds`. |
 | `maxWaitSeconds` | `900` | Upper bound for any single wait. |
 | `maxAttempts` | `12` | Per-step retry cap; after this the failure goes back to the default policy. |
+| `minWaitSeconds` | `1` | Floor for any wait or key cooldown, so a hint like "try again in 6ms" cannot burn the retry budget. Not on the settings page. |
 | `jitter` | `true` | Add up to 10 % (at most 5 s) to each wait. |
 | `waitOnQuota` | `false` | Also wait on `QUOTA` / `ACCOUNT_QUOTA` (the previous behaviour). |
 | `quotaCooldownMinutes` | `60` | How long a key that returned exhausted quota is skipped in rotate mode. |
 | `credentialRef` | `DEEPSEEK_API_KEY` | The credential reference the provider reads and that rotation writes to. |
 | `alternateKeyRefs` | `[]` | Credential references that form the key pool. Only reference names are stored here. |
-| `providerRefs` | `[]` | Optional `provider=REFERENCE` lines for providers that read different references. |
-| `keepOriginalKey` | `true` | Before the first rotation away from a key that is not in the pool, save it to `<REF>_RLG_ORIGINAL` and rotate through it too. |
+| `providerRefs` | `[]` | Optional `provider=REFERENCE` lines for providers that read different references. `provider=-` marks a provider that has no key to rotate. |
+| `keepOriginalKey` | `true` | Before the first rotation away from a key that is not in the pool, save it to `<REF>_RLG_ORIGINAL` and rotate through it too. That slot is never overwritten; a later unknown key (for example one typed into the target afterwards) goes to `<REF>_RLG_PREVIOUS`. |
 | `fallbackToWait` | `true` | When rotation is impossible, wait instead of handing the failure back. |
 | `guardedProviders` | `[]` | Allowlist of providers to guard; empty means all. |
 
@@ -163,6 +171,9 @@ each reference and writes new values through DSH's credentials service:
    masked and never returned by the API; the badge shows *configured* or *missing*.
 4. If providers map to different references, add lines like `shusheng=SHUSHENG_API_KEY`
    under **Provider mapping** so rotation targets the right one.
+5. For every provider that does not read an API key, add `provider=-` there. Without it
+   the guard would rotate the default reference on that provider's rate limits, which
+   cannot help and needlessly cools the pool down.
 
 Reference names must match `^[A-Za-z_][A-Za-z0-9_]*$`; the settings page refuses to save
 other names and the host ignores them. Values come from the credentials
@@ -190,9 +201,19 @@ very next request.
   cannot switch providers mid-step. Rotate mode therefore changes *the key the current
   provider reads*, not the provider itself. Use a separate provider selection if you need
   cross-provider failover.
-- **Account-login providers** (`deepseek-account`, OAuth-style routes) have no API key to
+- **Keyless providers.** `deepseek-account` and providers mapped to `-` have no API key to
   rotate. In rotate mode the guard logs the reason and falls back to waiting (unless
-  `fallbackToWait` is off).
+  `fallbackToWait` is off). Other keyless providers are not detected automatically.
+- **Retry-After headers may not arrive.** With DSH 0.2.2-rc.1 and an `openai-completions`
+  provider, a `Retry-After: 2` response header did not reach the plugin (the failure had
+  no `providerRetryAfterMs`); only a hint in the error message is honoured there, otherwise
+  the default wait applies.
+- **Rejected pool keys.** If the key a rotation just installed is rejected (`AUTH` / 401)
+  within a minute, for the same provider, the guard benches it for 24 h (in memory) and
+  installs the next pool key; at most two keys per rotation, so a failure that follows
+  every key cannot bench the pool. 403 is not treated as a rejected key (it usually means
+  the key may not use that model or region). Auth failures at any other time, or of a key
+  the guard did not install, are left to DSH.
 - **In-memory budget, cooldowns and log.** Attempt counters, key cooldowns and the 200-entry
   log ring are per process and reset when the plugin reloads or the app restarts. Key
   cooldowns store a SHA-256 fingerprint, never the key. The durable report is the
@@ -210,7 +231,7 @@ very next request.
 | --- | --- |
 | Settings page says the config was not found | Plugin enabled in this profile? Restart the app and reopen Settings. |
 | No wait happened | Is the provider covered by `guardedProviders`? Was the failure code one of `RATE_LIMIT`/`HTTP_429`/`QUOTA`/`ACCOUNT_QUOTA`? |
-| No rotation happened | Are alternates configured with values different from the current one? Is the provider an account-login route? Are all keys cooling down (`/ratelimit-log` shows the count)? |
+| No rotation happened | Are alternates configured with values different from the current one? Is the provider excluded (`provider=-`, `deepseek-account`)? Is the `credentials` service enabled in this profile? Are all keys cooling down (`/ratelimit-log` shows the count)? |
 | Want the original key back | It is stored in `<REF>_RLG_ORIGINAL`; it rejoins the rotation automatically, or copy it back on the settings page. |
 | Save fails | Settings document is read-only, or someone edited it concurrently — click reload and save again. |
 | `/ratelimit-log` is unknown | Host half not loaded; reinstall/re-enable the bundle. |
@@ -283,10 +304,17 @@ The suites stub only what the plugin touches (`ctx.on`, `ctx.inject`, `ctx.crede
 
 **限制**：一次重试只能复用同一提供方，不能中途切换提供方；账号登录型提供方
 （如 `deepseek-account`）没有可替换的 API Key，轮换会回退为等待。尝试次数、密钥冷却与
-日志缓存在内存中（冷却只记录密钥指纹），插件重载后清空。
+日志缓存在内存中（冷却只记录密钥指纹），插件重载后清空。不读取 API Key 的提供方
+（本地模型、固定请求头）需要在「按提供方映射」里写成 `提供方=-`，否则轮换模式会对它
+白白改写默认引用；轮换刚换上的密钥如果被服务端拒绝（401），会被暂停使用并换下
+一个（仅 401，403 不算）。无界面（headless）profile 默认不启用凭据服务，轮换不可用，会回退为等待。
 
 安装：把仓库目录放在固定位置，在插件管理中选择该目录安装 bundle，重启应用后在设置页
 配置。密钥只通过 DSH 凭据服务保存，设置页仅保存引用名称并显示掩码。
+
+## Changelog
+
+See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
