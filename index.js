@@ -16,10 +16,13 @@ import {
   backupRefFor,
   computeDelay,
   fingerprint,
+  isAuthFailure,
   isQuotaFailure,
   isRateLimitFailure,
   isValidRef,
   pickNext,
+  previousRefFor,
+  refForProvider,
 } from './lib.js'
 
 export const name = 'rate-limit-guard'
@@ -37,6 +40,15 @@ const STATE_TTL_MS = 2 * 60 * 60 * 1000
  */
 const ROTATE_GRACE_MS = 5000
 const CLOCK_SLOP_MS = 50
+/** How long after a rotation an auth failure is blamed on the key that rotation installed. */
+const REJECT_WINDOW_MS = 60_000
+/** A key the provider rejected stays out of the rotation this long (or until the plugin reloads). */
+const REJECTED_KEY_COOLDOWN_MS = 24 * 60 * 60 * 1000
+/**
+ * At most this many pool keys are benched as "rejected" per rate-limit rotation. An auth failure that
+ * follows every key around is not about the keys, and must not bench the whole pool.
+ */
+const MAX_REJECTS_PER_ROTATION = 2
 
 export const Config = z.object({
   mode: z.union(['wait', 'rotate']).default('wait').volatile(),
@@ -44,6 +56,7 @@ export const Config = z.object({
   useRetryAfter: z.boolean().default(true).volatile(),
   maxWaitSeconds: z.number().default(900).volatile(),
   maxAttempts: z.number().default(12).volatile(),
+  minWaitSeconds: z.number().default(1).volatile(),
   jitter: z.boolean().default(true).volatile(),
   waitOnQuota: z.boolean().default(false).volatile(),
   quotaCooldownMinutes: z.number().default(60).volatile(),
@@ -169,6 +182,7 @@ const ACTION_LABELS = {
   rotated: '已轮换密钥',
   'rotate-raced': '刚轮换过，直接重试',
   'rotate-unavailable': '无法轮换密钥',
+  'key-rejected': '密钥被拒绝',
   'original-saved': '已备份原密钥',
   'quota-handoff': '额度耗尽，交回处理',
   exhausted: '达到重试上限',
@@ -180,7 +194,7 @@ export function apply(ctx, config = {}) {
   const lifetime = new AbortController()
   /** fingerprint -> epoch ms until which that key is known to be limited / exhausted */
   const cooldowns = new Map()
-  /** target ref -> { id, at, toFp } of the latest rotation */
+  /** target ref -> { id, at, setAt, toFp, provider, rejects } of the latest rotation */
   const lastRotation = new Map()
   /** target ref -> tail of the promise chain that serializes rotations of that ref */
   const locks = new Map()
@@ -211,6 +225,7 @@ export function apply(ctx, config = {}) {
       useRetryAfter: readBoolean(config.useRetryAfter, true),
       maxWaitSeconds: readNumber(config.maxWaitSeconds, 900, 1, 86400),
       maxAttempts: readNumber(config.maxAttempts, 12, 1, 100),
+      minWaitSeconds: readNumber(config.minWaitSeconds, 1, 0, 60),
       jitter: readBoolean(config.jitter, true),
       waitOnQuota: readBoolean(config.waitOnQuota, false),
       quotaCooldownMinutes: readNumber(config.quotaCooldownMinutes, 60, 1, 7 * 24 * 60),
@@ -223,15 +238,21 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /** The reference rotation writes for `provider`; undefined when that provider has no key to rotate. */
   function resolveRef(provider, cfg) {
-    for (const item of cfg.providerRefs) {
-      const separator = item.indexOf('=')
-      if (separator <= 0) continue
-      if (item.slice(0, separator).trim() !== provider) continue
-      const ref = item.slice(separator + 1).trim()
-      return isValidRef(ref) ? ref : cfg.credentialRef
-    }
-    return cfg.credentialRef
+    return refForProvider(provider, cfg.providerRefs, cfg.credentialRef)
+  }
+
+  /**
+   * Remember that `fp` was just written into `ref`. The step that caused it must not get the
+   * "in-flight request" grace retry. `at` anchors the window in which an auth failure is blamed on the
+   * rotation; replacing a rejected key inherits it (and counts up `rejects`) so the window never renews.
+   */
+  function noteRotation(ref, fp, provider, state, inherit) {
+    const id = randomUUID()
+    const now = Date.now()
+    lastRotation.set(ref, { id, at: inherit?.at ?? now, setAt: now, toFp: fp, provider, rejects: inherit?.rejects ?? 0 })
+    if (state) state.graceFor = id
   }
 
   function formatEntry(entry) {
@@ -351,10 +372,23 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** Pool in rotation order: the backed-up original first, then the configured alternates. */
+  /**
+   * Read the target reference, keeping "could not read" apart from "empty": overwriting a key we failed
+   * to read would lose it without a backup.
+   */
+  async function readTarget(ref) {
+    try {
+      const value = (await credentials.resolve(ref))?.value
+      return { ok: true, value: typeof value === 'string' && value.length > 0 ? value : undefined }
+    } catch (error) {
+      return { ok: false, error }
+    }
+  }
+
+  /** Pool in rotation order: the backed-up keys first, then the configured alternates. */
   async function loadPool(cfg, ref) {
     const refs = []
-    if (cfg.keepOriginalKey) refs.push(backupRefFor(ref))
+    if (cfg.keepOriginalKey) refs.push(backupRefFor(ref), previousRefFor(ref))
     for (const alt of cfg.alternateKeyRefs) if (alt !== ref && !refs.includes(alt)) refs.push(alt)
     const pool = []
     for (const poolRef of refs) {
@@ -372,14 +406,17 @@ export function apply(ctx, config = {}) {
    * Result: { ok: true, keyRef, target } | { ok: true, raced: true } |
    *         { ok: false, reason, readyAt? }  (readyAt: when the earliest key comes off cooldown)
    */
-  function rotate(cfg, ref, state, cooldownMs) {
+  function rotate(cfg, ref, state, cooldownMs, provider) {
     return withLock(ref, async () => {
+      if (lifetime.signal.aborted) return { ok: false, reason: '插件已卸载' }
       const now = Date.now()
-      const current = await resolveValue(ref)
+      const target = await readTarget(ref)
+      if (!target.ok) return { ok: false, reason: `无法读取 ${ref}: ${messageOf(target.error)}` }
+      const current = target.value
       const currentFp = current === undefined ? undefined : fingerprint(current)
 
       const last = lastRotation.get(ref)
-      if (last && now - last.at < ROTATE_GRACE_MS && last.toFp === currentFp && state.graceFor !== last.id) {
+      if (last && now - last.setAt < ROTATE_GRACE_MS && last.toFp === currentFp && state.graceFor !== last.id) {
         state.graceFor = last.id
         return { ok: true, raced: true }
       }
@@ -387,18 +424,24 @@ export function apply(ctx, config = {}) {
       if (currentFp) cooldowns.set(currentFp, Math.max(cooldowns.get(currentFp) ?? 0, now + cooldownMs))
 
       let pool = await loadPool(cfg, ref)
-      const hasAlternates = pool.some((entry) => entry.ref !== backupRefFor(ref))
+      const backupRef = backupRefFor(ref)
+      const previousRef = previousRefFor(ref)
+      const hasAlternates = pool.some((entry) => entry.ref !== backupRef && entry.ref !== previousRef)
       if (cfg.keepOriginalKey && hasAlternates && current !== undefined && !pool.some((entry) => entry.fp === currentFp)) {
         // The key in use is not in the pool (the user's own key): keep a copy before overwriting it,
-        // so it rejoins the rotation once its window refreshes.
-        const backupRef = backupRefFor(ref)
+        // so it rejoins the rotation once its window refreshes. The first such key goes to the
+        // ORIGINAL slot and is never overwritten; a later one goes to the PREVIOUS slot.
+        const slot = pool.some((entry) => entry.ref === backupRef) ? previousRef : backupRef
         try {
-          await credentials.set(backupRef, current)
-          pool = [{ ref: backupRef, fp: currentFp, value: current }, ...pool.filter((entry) => entry.ref !== backupRef)]
-          record('info', { action: 'original-saved', keyRef: backupRef, note: `轮换前把 ${ref} 的原值保存到 ${backupRef}` })
+          await credentials.set(slot, current)
         } catch (error) {
-          return { ok: false, reason: `无法备份原密钥到 ${backupRef}: ${messageOf(error)}` }
+          return { ok: false, reason: `无法备份原密钥到 ${slot}: ${messageOf(error)}` }
         }
+        const saved = { ref: slot, fp: currentFp, value: current }
+        const rest = pool.filter((entry) => entry.ref !== slot)
+        const head = rest.filter((entry) => entry.ref === backupRef)
+        pool = [...head, saved, ...rest.filter((entry) => entry.ref !== backupRef)]
+        record('info', { action: 'original-saved', keyRef: slot, note: `轮换前把 ${ref} 的原值保存到 ${slot}` })
       }
 
       const choice = pickNext(pool, currentFp, cooldowns, now)
@@ -411,17 +454,68 @@ export function apply(ctx, config = {}) {
       } catch (error) {
         return { ok: false, reason: `无法写入 ${ref}: ${messageOf(error)}` }
       }
-      lastRotation.set(ref, { id: randomUUID(), at: Date.now(), toFp: choice.pick.fp })
+      noteRotation(ref, choice.pick.fp, provider, state)
       return { ok: true, keyRef: choice.pick.ref, target: ref }
     })
   }
 
-  /** After waiting out a full pool, put the first key that is off cooldown back into `ref`. */
-  function restoreReady(cfg, ref) {
+  /**
+   * The key a rotation just installed in `ref` was rejected by the provider (revoked or mistyped pool
+   * entry). Left in place it would fail every later request, so bench it and install another pool key.
+   * Result: { handled: false } when the key in `ref` is not a pool key, otherwise
+   *         { handled: true, rejectedRef, keyRef?, ready? }.
+   */
+  function replaceRejected(cfg, ref, state, provider) {
     return withLock(ref, async () => {
+      if (lifetime.signal.aborted) return { handled: false }
+      const now = Date.now()
+      // Re-check under the lock: only the key that this provider's rotation installed moments ago is
+      // the guard's to blame, and only a limited number of times per rotation.
+      const last = lastRotation.get(ref)
+      if (!last || last.provider !== provider || now - last.at > REJECT_WINDOW_MS) return { handled: false }
+      const target = await readTarget(ref)
+      if (!target.ok || target.value === undefined) return { handled: false }
+      const currentFp = fingerprint(target.value)
+      if (last.toFp !== currentFp) return { handled: false }
+      // Another request already replaced the rejected key; this failure most likely still used the old
+      // one. Retry once on the replacement instead of benching a key nobody has tried yet.
+      if (last.rejects > 0 && now - last.setAt < ROTATE_GRACE_MS && state.graceFor !== last.id) {
+        state.graceFor = last.id
+        return { handled: true, raced: true }
+      }
+      if (last.rejects >= MAX_REJECTS_PER_ROTATION) return { handled: false }
+      const pool = await loadPool(cfg, ref)
+      const rejected = pool.find((entry) => entry.fp === currentFp)
+      if (!rejected) return { handled: false }
+      cooldowns.set(currentFp, now + REJECTED_KEY_COOLDOWN_MS)
+      const choice = pickNext(pool, currentFp, cooldowns, now)
+      // Nothing ready: still swap in the key that comes back first, so the rejected one is not left behind.
+      const pick = choice.pick ?? pool
+        .filter((entry) => entry.fp !== currentFp)
+        .sort((a, b) => (cooldowns.get(a.fp) ?? 0) - (cooldowns.get(b.fp) ?? 0))[0]
+      if (!pick) return { handled: true, rejectedRef: rejected.ref }
+      try {
+        await credentials.set(ref, pick.value)
+      } catch {
+        return { handled: true, rejectedRef: rejected.ref }
+      }
+      const ready = choice.pick !== undefined
+      // A key that is still cooling is only parked here; it was not tried, so it earns no grace/blame.
+      if (ready) noteRotation(ref, pick.fp, provider, state, { at: last.at, rejects: last.rejects + 1 })
+      else lastRotation.delete(ref)
+      return { handled: true, rejectedRef: rejected.ref, keyRef: pick.ref, ready }
+    })
+  }
+
+  /** After waiting out a full pool, put the first key that is off cooldown back into `ref`. */
+  function restoreReady(cfg, ref, state, provider) {
+    return withLock(ref, async () => {
+      if (lifetime.signal.aborted) return undefined
       // Timers may fire a millisecond before Date.now() reaches the cooldown end; allow for that.
       const now = Date.now() + CLOCK_SLOP_MS
-      const current = await resolveValue(ref)
+      const target = await readTarget(ref)
+      if (!target.ok) return undefined
+      const current = target.value
       const currentFp = current === undefined ? undefined : fingerprint(current)
       if (currentFp && (cooldowns.get(currentFp) ?? 0) <= now) return undefined
       const pool = await loadPool(cfg, ref)
@@ -429,7 +523,7 @@ export function apply(ctx, config = {}) {
       if (!choice.pick) return undefined
       try {
         await credentials.set(ref, choice.pick.value)
-        lastRotation.set(ref, { id: randomUUID(), at: Date.now(), toFp: choice.pick.fp })
+        noteRotation(ref, choice.pick.fp, provider, state)
         return choice.pick.ref
       } catch {
         return undefined
@@ -475,26 +569,11 @@ export function apply(ctx, config = {}) {
     return { kind: 'retry' }
   }
 
-  async function handle(payload, next) {
-    const { agent, turn, step, provider, failure, signal } = payload ?? {}
-    if (!failure || !isRateLimitFailure(failure)) return next()
-    if (lifetime.signal.aborted || signal?.aborted) return next()
-
-    const cfg = readConfig()
-    if (cfg.guardedProviders.length > 0 && !cfg.guardedProviders.includes(provider)) return next()
-
-    const quota = isQuotaFailure(failure)
-    // Waiting does not refill a balance; only a different key can help.
-    if (quota && cfg.mode === 'wait' && !cfg.waitOnQuota) {
-      record('warn', {
-        action: 'quota-handoff',
-        provider,
-        code: failure.code,
-        note: '额度/余额已耗尽，等待不会恢复，交回默认处理',
-      })
-      return next()
-    }
-
+  /**
+   * Count one guarded attempt for this step. Returns undefined once the per-step cap is reached
+   * (the caller then hands the failure back), otherwise the step state and the retry event base.
+   */
+  function beginAttempt({ agent, turn, step, provider, failure }, cfg) {
     prune()
     const stateKey = `${agent?.session?.id ?? 'unknown'}:${turn}:${step}`
     let state = attempts.get(stateKey)
@@ -513,10 +592,9 @@ export function apply(ctx, config = {}) {
           note: `本步骤已达到 ${cfg.maxAttempts} 次上限，交回后续处理器`,
         })
       }
-      return next()
+      return undefined
     }
     state.count += 1
-    const retry = state.count
     const base = {
       retryId: state.retryId,
       turn,
@@ -524,10 +602,76 @@ export function apply(ctx, config = {}) {
       provider,
       mode: 'normal',
       policyKey: 'rate-limit-guard',
-      retry,
+      retry: state.count,
       maxRetries: cfg.maxAttempts,
       failure: normalizeFailure(failure),
     }
+    return { state, retry: state.count, base }
+  }
+
+  /** Auth failure right after a rotation: the key the guard just installed is bad. */
+  async function handleRejectedKey(payload, next) {
+    const { agent, turn, step, provider, failure, signal } = payload
+    if (lifetime.signal.aborted || signal?.aborted || !credentials) return next()
+    const cfg = readConfig()
+    if (cfg.mode !== 'rotate') return next()
+    if (cfg.guardedProviders.length > 0 && !cfg.guardedProviders.includes(provider)) return next()
+    const ref = resolveRef(provider, cfg)
+    if (!ref) return next()
+    // Only blame the key when this provider's own rotation installed it moments ago; any other auth
+    // failure (a different provider, the user's own key) is not the guard's to fix.
+    const last = lastRotation.get(ref)
+    if (!last || last.provider !== provider || Date.now() - last.at > REJECT_WINDOW_MS) return next()
+
+    const attempt = beginAttempt(payload, cfg)
+    if (!attempt) return next()
+    const outcome = await replaceRejected(cfg, ref, attempt.state, provider)
+    if (!outcome.handled) return next()
+    if (outcome.raced) {
+      record('info', { action: 'rotate-raced', provider, retry: attempt.retry, note: '被拒绝的密钥已被换掉，直接用新密钥重试' })
+      appendScheduled(agent, { ...attempt.base, delayMs: 0 })
+      appendStarted(agent, { retryId: attempt.base.retryId, turn, step, retry: attempt.retry })
+      return { kind: 'retry' }
+    }
+    const usable = outcome.keyRef !== undefined && outcome.ready
+    record('warn', {
+      action: 'key-rejected',
+      provider,
+      code: failure.code,
+      retry: attempt.retry,
+      note: `${outcome.rejectedRef} 的密钥被服务端拒绝，已暂停使用；${
+        outcome.keyRef === undefined ? '没有其他密钥可换' : usable ? `改用 ${outcome.keyRef} 重试` : `已换回 ${outcome.keyRef}（仍在冷却），交回后续处理器`}`,
+    })
+    if (!usable) return next()
+    appendScheduled(agent, { ...attempt.base, delayMs: 0 })
+    appendStarted(agent, { retryId: attempt.base.retryId, turn, step, retry: attempt.retry })
+    return { kind: 'retry' }
+  }
+
+  async function handle(payload, next) {
+    const { agent, turn, step, provider, failure, signal } = payload ?? {}
+    if (!failure) return next()
+    if (!isRateLimitFailure(failure)) return isAuthFailure(failure) ? handleRejectedKey(payload, next) : next()
+    if (lifetime.signal.aborted || signal?.aborted) return next()
+
+    const cfg = readConfig()
+    if (cfg.guardedProviders.length > 0 && !cfg.guardedProviders.includes(provider)) return next()
+
+    const quota = isQuotaFailure(failure)
+    // Waiting does not refill a balance; only a different key can help.
+    if (quota && cfg.mode === 'wait' && !cfg.waitOnQuota) {
+      record('warn', {
+        action: 'quota-handoff',
+        provider,
+        code: failure.code,
+        note: '额度/余额已耗尽，等待不会恢复，交回默认处理',
+      })
+      return next()
+    }
+
+    const attempt = beginAttempt(payload, cfg)
+    if (!attempt) return next()
+    const { state, retry, base } = attempt
 
     record('info', {
       action: 'detected',
@@ -546,18 +690,18 @@ export function apply(ctx, config = {}) {
     const fallback = quota && !cfg.waitOnQuota ? false : cfg.fallbackToWait
 
     if (cfg.mode === 'rotate') {
-      if (!credentials) {
+      const ref = resolveRef(provider, cfg)
+      if (!credentials || !ref) {
         record('warn', {
           action: 'rotate-unavailable',
           provider,
           retry,
-          note: `credentials 服务不可用${fallback ? '，回退为等待' : '，交回后续处理器'}`,
+          note: `${credentials ? `提供方 ${provider} 没有可轮换的密钥` : 'credentials 服务不可用'}${fallback ? '，回退为等待' : '，交回后续处理器'}`,
         })
         if (!fallback) return next()
       } else {
-        const ref = resolveRef(provider, cfg)
         const cooldownMs = quota ? cfg.quotaCooldownMinutes * 60_000 : delayMs
-        const outcome = await rotate(cfg, ref, state, cooldownMs)
+        const outcome = await rotate(cfg, ref, state, cooldownMs, provider)
         if (outcome.ok) {
           appendScheduled(agent, { ...base, delayMs: 0 })
           appendStarted(agent, { retryId: base.retryId, turn, step, retry })
@@ -577,7 +721,7 @@ export function apply(ctx, config = {}) {
           // Every key is cooling: wait for the first one to come back instead of hammering the pool.
           const untilReady = Math.max(0, Math.min(outcome.readyAt - Date.now(), cfg.maxWaitSeconds * 1000))
           return waitAndRetry(payload, base, Math.round(untilReady), '等待最早恢复的密钥', async () => {
-            const restored = await restoreReady(cfg, ref)
+            const restored = await restoreReady(cfg, ref, state, provider)
             if (restored) record('info', { action: 'rotated', provider, retry, keyRef: ref, note: `等待后改用 ${restored}` })
           })
         }

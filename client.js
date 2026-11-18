@@ -62,7 +62,7 @@ window.__ModuleLoader__.load({
         quotaCooldownMinutesHint: 'QUOTA / ACCOUNT_QUOTA 的密钥在这段时间内不会再被选中。',
         invalidRefs: '引用名称只能包含字母、数字和下划线，且不能以数字开头',
         providerRefs: '按提供方映射（provider=引用）',
-        providerRefsHint: '可选，每行一条，例如 deepseek-api-key=DEEPSEEK_API_KEY。未匹配的提供方使用目标密钥引用。',
+        providerRefsHint: '可选，每行一条，例如 deepseek-api-key=DEEPSEEK_API_KEY。未匹配的提供方使用目标密钥引用。不读取 API Key 的提供方（本地模型、固定请求头等）请写成 提供方=-，对它只等待不轮换。',
         fallbackToWait: '没有可用备用密钥时改为等待',
         fallbackToWaitHint: '关闭后会把限流错误交回后续处理器，不再等待。',
         keysEmpty: '先在“目标密钥引用”里填写引用名称，再保存。',
@@ -127,7 +127,7 @@ window.__ModuleLoader__.load({
         quotaCooldownMinutesHint: 'A key that returned QUOTA / ACCOUNT_QUOTA is not picked again for this long.',
         invalidRefs: 'Reference names may only contain letters, digits and underscores, and must not start with a digit',
         providerRefs: 'Provider mapping (provider=ref)',
-        providerRefsHint: 'Optional, one per line, e.g. deepseek-api-key=DEEPSEEK_API_KEY. Unmatched providers use the target reference.',
+        providerRefsHint: 'Optional, one per line, e.g. deepseek-api-key=DEEPSEEK_API_KEY. Unmatched providers use the target reference. For a provider that reads no API key (local models, fixed headers) write provider=- so it only waits and is never rotated.',
         fallbackToWait: 'Wait when no pool key is usable',
         fallbackToWaitHint: 'Turn this off to hand the failure back to later handlers instead of waiting.',
         keysEmpty: 'Enter a target credential reference first.',
@@ -220,11 +220,14 @@ window.__ModuleLoader__.load({
 
     const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+    const isNoRotate = (ref) => ref === '' || ref === '-'
+
     function invalidRefsOf(draft) {
       const refs = [String(draft.credentialRef ?? '').trim(), ...splitList(draft.alternateKeyRefs)]
       for (const mapping of splitList(draft.providerRefs)) {
         const separator = mapping.indexOf('=')
-        refs.push(separator > 0 ? mapping.slice(separator + 1).trim() : mapping)
+        if (separator <= 0) refs.push(mapping)
+        else if (!isNoRotate(mapping.slice(separator + 1).trim())) refs.push(mapping.slice(separator + 1).trim())
       }
       return refs.filter((ref) => ref !== '' && !REF_PATTERN.test(ref))
     }
@@ -242,7 +245,7 @@ window.__ModuleLoader__.load({
       for (const ref of splitList(value.alternateKeyRefs)) push(ref)
       for (const mapping of splitList(value.providerRefs)) {
         const separator = mapping.indexOf('=')
-        if (separator > 0) push(mapping.slice(separator + 1))
+        if (separator > 0 && !isNoRotate(mapping.slice(separator + 1).trim())) push(mapping.slice(separator + 1))
       }
       return out
     }

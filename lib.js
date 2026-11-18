@@ -23,6 +23,42 @@ export function isRateLimitFailure(failure) {
   return failure.status === 429
 }
 
+/**
+ * The provider rejected the credential itself (revoked, mistyped).
+ * 403 is deliberately not included: it usually means "this key may not do that" (model, region,
+ * content policy), which another key would not fix.
+ */
+export function isAuthFailure(failure) {
+  if (!failure) return false
+  const code = typeof failure.code === 'string' ? failure.code : ''
+  if (code === 'AUTH' || code === 'INVALID_CREDENTIAL' || code === 'HTTP_401') return true
+  return failure.status === 401
+}
+
+/** Providers that sign in with an account instead of reading an API key: nothing to rotate. */
+export const KEYLESS_PROVIDERS = new Set(['deepseek-account'])
+
+/** `provider=-` (or nothing after `=`) in the provider mapping: never rotate for this provider. */
+export function isNoRotateMarker(value) {
+  return value === '' || value === '-'
+}
+
+/**
+ * Which credential reference rotation should write for `provider`, or undefined when the provider has
+ * no rotatable key. `mappings` are `provider=REFERENCE` lines; an invalid reference falls back to the default.
+ */
+export function refForProvider(provider, mappings, defaultRef) {
+  for (const item of mappings) {
+    const separator = item.indexOf('=')
+    if (separator <= 0) continue
+    if (item.slice(0, separator).trim() !== provider) continue
+    const ref = item.slice(separator + 1).trim()
+    if (isNoRotateMarker(ref)) return undefined
+    return isValidRef(ref) ? ref : defaultRef
+  }
+  return KEYLESS_PROVIDERS.has(provider) ? undefined : defaultRef
+}
+
 export function isQuotaFailure(failure) {
   return !!failure && typeof failure.code === 'string' && QUOTA_CODES.has(failure.code)
 }
@@ -40,9 +76,16 @@ function unitMs(unit) {
   return undefined
 }
 
+const UNIT = String.raw`milliseconds?|msec|ms|毫秒|seconds?|secs?|s|秒钟|秒|minutes?|mins?|min|m|分钟|分|hours?|hrs?|hr|h|小时`
 // One "<number><unit>" piece. Longer unit spellings come first so "ms" is not read as "m".
-const PIECE = String.raw`(\d+(?:\.\d+)?)\s*(milliseconds?|msec|ms|毫秒|seconds?|secs?|s|秒钟|秒|minutes?|mins?|min|m|分钟|分|hours?|hrs?|hr|h|小时)?`
-const DURATION = String.raw`(?:\d+(?:\.\d+)?\s*(?:milliseconds?|msec|ms|毫秒|seconds?|secs?|s|秒钟|秒|minutes?|mins?|min|m|分钟|分|hours?|hrs?|hr|h|小时)?\s*){1,4}`
+const PIECE = String.raw`(\d+(?:\.\d+)?)\s*(${UNIT})?`
+// A duration whose every number carries a unit ("1m30s", "30 秒"). The lookahead keeps a unit letter
+// from being the start of a word: "3 samples" is not 3 s.
+const UNITED = String.raw`(?:\d+(?:\.\d+)?\s*(?:${UNIT})(?![A-Za-z])\s*){1,4}`
+// A number with no unit, read as seconds. Not part of a date/time, a longer number or "<n> <word>"
+// (Latin or CJK: "retry after 5 次失败" is not 5 s).
+const BARE = String.raw`\d+(?:\.\d+)?(?!\d|\.\d|\s*[-:/A-Za-z\u4e00-\u9fff])`
+const NUMBER = String.raw`\d+(?:\.\d+)?`
 
 /** Sum a compound duration such as "1m30s", "6m0s", "1 分 30 秒" or a bare "20" (seconds). */
 export function parseDuration(text) {
@@ -64,21 +107,31 @@ export function parseDuration(text) {
   return found && total > 0 ? total : undefined
 }
 
+// Each entry: [pattern, how to read capture 1]. First match wins.
 const HINT_PATTERNS = [
-  // English: "retry after 30s", "Please try again in 1m30s", "limit resets in 20 seconds"
-  new RegExp(String.raw`(?:retry[-_ ]?after|try again in|resets? in|wait)[^0-9]{0,12}(${DURATION})`, 'i'),
-  // Chinese: "请在 30 秒后重试", "请 1 分钟后再试", "1分30秒后重试"
-  new RegExp(String.raw`(${DURATION})\s*(?:之?后|以后)[^0-9]{0,6}(?:重试|再试|再次|恢复)`, 'i'),
+  // "retry_after_ms": 1500, "retry-after-ms: 250": the number is milliseconds.
+  [new RegExp(String.raw`retry[-_ ]?after[-_ ]?ms[^0-9]{0,12}(${NUMBER})`, 'i'), (text) => Number(text)],
+  // "retry after 30s", "Retry-After: 12": the one phrasing where a bare number means seconds.
+  [new RegExp(String.raw`retry[-_ ]?after(?![-_ ]?ms)[^0-9]{0,12}(${UNITED}|${BARE})`, 'i'), parseDuration],
+  // "try again in 1m30s", "retry in 34.5s", "resets in 20 seconds", "resets after 20s",
+  // "available in 5 seconds", "wait 1 minute", "retryDelay":"34s".
+  // These need a unit: "please wait (429)" and "resets in 3 requests" are not durations.
+  // \bwait\b: "request waited 30s in queue" is not a hint.
+  [new RegExp(String.raw`(?:try again in|retry in|retry[-_ ]?delay|resets? (?:in|after)|available in|\bwait(?:ing)?\b(?: for)?)[^0-9]{0,12}(${UNITED})`, 'i'), parseDuration],
+  // Chinese: "请在 30 秒后重试", "请 1 分钟后再试", "1分30秒后重试", "请于1分钟后再发起请求"
+  [new RegExp(String.raw`(${UNITED})\s*(?:之?后|以后)[^0-9]{0,6}(?:重试|再|恢复|继续)`, 'i'), parseDuration],
+  // "请等待 30 秒"
+  [new RegExp(String.raw`等待\s*(${UNITED})`, 'i'), parseDuration],
 ]
 
 /** Best-effort wait hint (ms) from a provider message. */
 export function parseRetryHint(message) {
   if (typeof message !== 'string' || message.length === 0) return undefined
-  for (const pattern of HINT_PATTERNS) {
+  for (const [pattern, read] of HINT_PATTERNS) {
     const match = pattern.exec(message)
     if (!match) continue
-    const ms = parseDuration(match[1])
-    if (ms !== undefined) return ms
+    const ms = read(match[1])
+    if (Number.isFinite(ms) && ms > 0) return ms
   }
   return undefined
 }
@@ -100,6 +153,9 @@ export function computeDelay(failure, cfg, random = Math.random) {
     delayMs = hintMs
     source = 'message-hint'
   }
+  // A provider may hint a few milliseconds ("try again in 6ms"); retrying that fast only burns the
+  // per-step budget, so hints are raised to the configured floor (default 1 s).
+  delayMs = Math.max(delayMs, (cfg.minWaitSeconds ?? 1) * 1000)
   if (cfg.jitter) delayMs += random() * Math.min(delayMs * 0.1, 5000)
   delayMs = Math.round(Math.min(Math.max(0, delayMs), cfg.maxWaitSeconds * 1000))
   return { delayMs, source }
@@ -113,6 +169,14 @@ export function fingerprint(value) {
 /** Reference that holds the key the user had before the guard first rotated away from it. */
 export function backupRefFor(ref) {
   return `${ref}_RLG_ORIGINAL`
+}
+
+/**
+ * Second backup slot: a later key that is in neither the pool nor the first backup (for example a
+ * key the user typed into the target after rotations started). Keeps the first backup intact.
+ */
+export function previousRefFor(ref) {
+  return `${ref}_RLG_PREVIOUS`
 }
 
 /**
