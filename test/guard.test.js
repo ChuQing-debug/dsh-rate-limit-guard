@@ -472,3 +472,30 @@ test('a key typed into the target during a rotation is not overwritten', async (
   assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'typed-meanwhile')
   assert.equal(h.nextCalls(), 1)
 })
+
+test('the fallback after a rejection is never another rejected key', async () => {
+  // the original is exhausted for 48 h (longer than a rejection bench), both alternates are revoked
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A', 'KEY_B'], quotaCooldownMinutes: 2880 },
+    { DEEPSEEK_API_KEY: 'orig', KEY_A: 'bad-a', KEY_B: 'bad-b' },
+  )
+  await h.fire({ code: 'QUOTA', message: '402: quota exceeded' })
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'bad-a')
+  await h.fire({ code: 'AUTH', message: '401: Invalid API key' })
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'bad-b')
+  await h.fire({ code: 'AUTH', message: '401: Invalid API key' })
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'orig', 'back on the original, not on the first rejected alternate')
+})
+
+test('a rejected key is replaced even when the step has no retries left', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A', 'KEY_B'], maxAttempts: 1 },
+    { DEEPSEEK_API_KEY: 'orig', KEY_A: 'revoked', KEY_B: 'bbb' },
+  )
+  assert.deepEqual(await h.fire(limited()), { kind: 'retry' })
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'revoked')
+  // the only allowed attempt is spent: no further retry, but the bad key must not stay installed
+  assert.equal(await h.fire({ code: 'AUTH', message: '401: Invalid API key' }), undefined)
+  assert.equal(h.nextCalls(), 1)
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'bbb')
+})

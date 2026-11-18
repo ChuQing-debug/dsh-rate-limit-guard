@@ -648,10 +648,11 @@ export function apply(ctx, config = {}) {
       rejectedFps.add(currentFp)
       rejectTimes.set(ref, [...recent, now])
       const choice = pickNext(pool, currentFp, cooldowns, now)
-      // Nothing ready: still swap in the key that comes back first, so the rejected one is not left behind.
+      // Nothing ready: still swap in a key so the rejected one is not left behind. Never another
+      // rejected key, however soon its bench ends; the user's own key first, then whichever is back first.
       const pick = choice.pick ?? pool
-        .filter((entry) => entry.fp !== currentFp)
-        .sort((a, b) => (cooldowns.get(a.fp) ?? 0) - (cooldowns.get(b.fp) ?? 0))[0]
+        .filter((entry) => entry.fp !== currentFp && !rejectedFps.has(entry.fp))
+        .sort((a, b) => Number(isBackup(b.ref)) - Number(isBackup(a.ref)) || (cooldowns.get(a.fp) ?? 0) - (cooldowns.get(b.fp) ?? 0))[0]
       if (!pick) return { handled: true, rejectedRef: rejected.ref }
       try {
         await writeTarget(ref, pick.value, currentFp)
@@ -805,16 +806,18 @@ export function apply(ctx, config = {}) {
     const last = lastRotation.get(ref)
     if (!last || last.provider !== provider || Date.now() - last.at > REJECT_WINDOW_MS) return next()
 
+    // Replacing the rejected key is cleanup, not a retry: it happens even when this step has no
+    // attempts left (maxAttempts: 1, or the last allowed rotation), so the bad key is never left behind.
     const attempt = beginAttempt(payload, cfg)
-    if (!attempt) return next()
-    const outcome = await replaceRejected(cfg, ref, attempt.state, provider)
+    const retryNo = attempt?.retry
+    const outcome = await replaceRejected(cfg, ref, attempt?.state ?? {}, provider)
     if (!outcome.handled) return next()
     if (outcome.limited) {
       record('warn', {
         action: 'key-rejected',
         provider,
         code: failure.code,
-        retry: attempt.retry,
+        retry: retryNo,
         note: L(
           `短时间内已有多个密钥被拒绝，问题可能不在密钥本身；不再暂停密钥，已把 ${ref} 换回 ${outcome.keyRef}，交回后续处理器`,
           `several keys were rejected in a short time, so the keys are probably not the cause; benching stopped, ${ref} switched back to ${outcome.keyRef}, handing back`,
@@ -823,22 +826,26 @@ export function apply(ctx, config = {}) {
       return next()
     }
     if (outcome.raced) {
+      if (!attempt) return next()
       record('info', { action: 'rotate-raced', provider, retry: attempt.retry, note: L('被拒绝的密钥已被换掉，直接用新密钥重试', 'the rejected key was already replaced, retrying on the new key') })
       appendScheduled(agent, { ...attempt.base, delayMs: 0 })
       appendStarted(agent, { retryId: attempt.base.retryId, turn, step, retry: attempt.retry })
       return { kind: 'retry' }
     }
-    const usable = outcome.keyRef !== undefined && outcome.ready
+    const usable = outcome.keyRef !== undefined && outcome.ready && attempt !== undefined
+    const swapped = outcome.ready
+      ? L(`已改用 ${outcome.keyRef}（本步骤重试次数已用完），交回后续处理器`, `switched to ${outcome.keyRef} (this step has no retries left), handing back`)
+      : L(`已换回 ${outcome.keyRef}（仍在冷却），交回后续处理器`, `switched back to ${outcome.keyRef} (still cooling), handing back`)
     record('warn', {
       action: 'key-rejected',
       provider,
       code: failure.code,
-      retry: attempt.retry,
+      retry: retryNo,
       note: L(
         `${outcome.rejectedRef} 的密钥被服务端拒绝，已暂停使用；${
-          outcome.keyRef === undefined ? '没有其他密钥可换' : usable ? `改用 ${outcome.keyRef} 重试` : `已换回 ${outcome.keyRef}（仍在冷却），交回后续处理器`}`,
+          outcome.keyRef === undefined ? '没有其他未被拒绝的密钥可换' : usable ? `改用 ${outcome.keyRef} 重试` : swapped}`,
         `the provider rejected the key from ${outcome.rejectedRef}, benched; ${
-          outcome.keyRef === undefined ? 'no other key to switch to' : usable ? `retrying with ${outcome.keyRef}` : `switched back to ${outcome.keyRef} (still cooling), handing back`}`,
+          outcome.keyRef === undefined ? 'no other key that was not rejected' : usable ? `retrying with ${outcome.keyRef}` : swapped}`,
       ),
     })
     if (!usable) return next()
