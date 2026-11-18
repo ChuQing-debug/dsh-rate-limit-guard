@@ -12,26 +12,45 @@
  */
 import { randomUUID } from 'node:crypto'
 import z from './vendor/schemastery.mjs'
+import {
+  backupRefFor,
+  computeDelay,
+  fingerprint,
+  isQuotaFailure,
+  isRateLimitFailure,
+  isValidRef,
+  pickNext,
+} from './lib.js'
 
 export const name = 'rate-limit-guard'
 
 /** `agents` guarantees the composition that dispatches `agent/request-error`. */
 export const inject = ['agents']
 
-const RATE_LIMIT_CODES = new Set(['RATE_LIMIT', 'HTTP_429', 'QUOTA', 'ACCOUNT_QUOTA'])
 const LOG_LIMIT = 200
 const STATE_LIMIT = 512
 const STATE_TTL_MS = 2 * 60 * 60 * 1000
+/**
+ * A failure that arrives this soon after a rotation most likely came from a request that was
+ * already in flight with the old key (another session, or this one racing). Retry it once on the
+ * new key instead of rotating again and skipping a pool entry.
+ */
+const ROTATE_GRACE_MS = 5000
+const CLOCK_SLOP_MS = 50
 
 export const Config = z.object({
-  mode: z.string().default('wait').volatile(),
+  mode: z.union(['wait', 'rotate']).default('wait').volatile(),
   waitSeconds: z.number().default(60).volatile(),
   useRetryAfter: z.boolean().default(true).volatile(),
   maxWaitSeconds: z.number().default(900).volatile(),
   maxAttempts: z.number().default(12).volatile(),
+  jitter: z.boolean().default(true).volatile(),
+  waitOnQuota: z.boolean().default(false).volatile(),
+  quotaCooldownMinutes: z.number().default(60).volatile(),
   credentialRef: z.string().default('DEEPSEEK_API_KEY').volatile(),
   alternateKeyRefs: z.array(z.string()).default([]).volatile(),
   providerRefs: z.array(z.string()).default([]).volatile(),
+  keepOriginalKey: z.boolean().default(true).volatile(),
   fallbackToWait: z.boolean().default(true).volatile(),
   guardedProviders: z.array(z.string()).default([]).volatile(),
 })
@@ -84,35 +103,6 @@ function readStrings(value) {
 function truncate(text, max) {
   const value = String(text ?? '')
   return value.length > max ? `${value.slice(0, max - 1)}…` : value
-}
-
-function isRateLimitFailure(failure) {
-  if (!failure) return false
-  const code = typeof failure.code === 'string' ? failure.code : ''
-  if (RATE_LIMIT_CODES.has(code)) return true
-  if (code.startsWith('HTTP_429')) return true
-  return failure.status === 429
-}
-
-/** Best-effort wait hint from a provider message such as "retry after 30s". */
-function parseRetryHint(message) {
-  if (typeof message !== 'string' || message.length === 0) return undefined
-  const patterns = [
-    /retry[-_ ]?after[^0-9]{0,12}(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?|m|minutes?)?/i,
-    /try again in[^0-9]{0,12}(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?|m|minutes?)?/i,
-    /reset[s]? in[^0-9]{0,12}(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?|m|minutes?)?/i,
-  ]
-  for (const pattern of patterns) {
-    const match = pattern.exec(message)
-    if (!match) continue
-    const amount = Number(match[1])
-    if (!Number.isFinite(amount) || amount <= 0) continue
-    const unit = (match[2] ?? 's').toLowerCase()
-    if (unit.startsWith('ms') || unit.startsWith('millisecond')) return amount
-    if (unit.startsWith('m')) return amount * 60_000
-    return amount * 1000
-  }
-  return undefined
 }
 
 function normalizeFailure(failure) {
@@ -177,7 +167,10 @@ const ACTION_LABELS = {
   resumed: '已恢复并继续',
   aborted: '等待被取消',
   rotated: '已轮换密钥',
+  'rotate-raced': '刚轮换过，直接重试',
   'rotate-unavailable': '无法轮换密钥',
+  'original-saved': '已备份原密钥',
+  'quota-handoff': '额度耗尽，交回处理',
   exhausted: '达到重试上限',
 }
 
@@ -185,6 +178,12 @@ export function apply(ctx, config = {}) {
   const attempts = new Map()
   const logs = []
   const lifetime = new AbortController()
+  /** fingerprint -> epoch ms until which that key is known to be limited / exhausted */
+  const cooldowns = new Map()
+  /** target ref -> { id, at, toFp } of the latest rotation */
+  const lastRotation = new Map()
+  /** target ref -> tail of the promise chain that serializes rotations of that ref */
+  const locks = new Map()
   let credentials
 
   ctx.inject(['credentials'], (sub) => {
@@ -205,15 +204,20 @@ export function apply(ctx, config = {}) {
 
   function readConfig() {
     const mode = readField(config.mode, 'wait') === 'rotate' ? 'rotate' : 'wait'
+    const credentialRef = String(readField(config.credentialRef, 'DEEPSEEK_API_KEY') || '').trim()
     return {
       mode,
       waitSeconds: readNumber(config.waitSeconds, 60, 1, 86400),
       useRetryAfter: readBoolean(config.useRetryAfter, true),
       maxWaitSeconds: readNumber(config.maxWaitSeconds, 900, 1, 86400),
       maxAttempts: readNumber(config.maxAttempts, 12, 1, 100),
-      credentialRef: String(readField(config.credentialRef, 'DEEPSEEK_API_KEY') || 'DEEPSEEK_API_KEY'),
-      alternateKeyRefs: readStrings(config.alternateKeyRefs),
+      jitter: readBoolean(config.jitter, true),
+      waitOnQuota: readBoolean(config.waitOnQuota, false),
+      quotaCooldownMinutes: readNumber(config.quotaCooldownMinutes, 60, 1, 7 * 24 * 60),
+      credentialRef: isValidRef(credentialRef) ? credentialRef : 'DEEPSEEK_API_KEY',
+      alternateKeyRefs: readStrings(config.alternateKeyRefs).filter(isValidRef),
       providerRefs: readStrings(config.providerRefs),
+      keepOriginalKey: readBoolean(config.keepOriginalKey, true),
       fallbackToWait: readBoolean(config.fallbackToWait, true),
       guardedProviders: readStrings(config.guardedProviders),
     }
@@ -224,7 +228,8 @@ export function apply(ctx, config = {}) {
       const separator = item.indexOf('=')
       if (separator <= 0) continue
       if (item.slice(0, separator).trim() !== provider) continue
-      return item.slice(separator + 1).trim() || cfg.credentialRef
+      const ref = item.slice(separator + 1).trim()
+      return isValidRef(ref) ? ref : cfg.credentialRef
     }
     return cfg.credentialRef
   }
@@ -274,9 +279,12 @@ export function apply(ctx, config = {}) {
   function renderLog() {
     const cfg = readConfig()
     const modeText = cfg.mode === 'rotate'
-      ? `轮换密钥（目标 ${cfg.credentialRef}${cfg.alternateKeyRefs.length ? `，${cfg.alternateKeyRefs.length} 个备用引用` : '，未配置备用引用'}）`
+      ? `轮换密钥（目标 ${cfg.credentialRef}${cfg.alternateKeyRefs.length ? `，${cfg.alternateKeyRefs.length} 个备用引用` : '，未配置备用引用'}${cfg.keepOriginalKey ? `，原密钥备份在 ${backupRefFor(cfg.credentialRef)}` : ''}）`
       : `等待（默认 ${cfg.waitSeconds}s，上限 ${cfg.maxWaitSeconds}s）`
     const lines = [`限流守护 · 当前模式：${modeText}`]
+    const now = Date.now()
+    const cooling = [...cooldowns.values()].filter((until) => until > now).length
+    if (cooling > 0) lines.push(`冷却中的密钥：${cooling} 个`)
     if (logs.length === 0) {
       lines.push('尚未记录到限流事件。')
       return lines.join('\n')
@@ -290,8 +298,10 @@ export function apply(ctx, config = {}) {
   }
 
   function prune() {
+    const now = Date.now()
+    for (const [fp, until] of cooldowns) if (until <= now) cooldowns.delete(fp)
     if (attempts.size <= STATE_LIMIT) return
-    const cutoff = Date.now() - STATE_TTL_MS
+    const cutoff = now - STATE_TTL_MS
     for (const [key, entry] of attempts) {
       if (entry.startedAt < cutoff) attempts.delete(key)
     }
@@ -320,35 +330,149 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  async function rotate(cfg, ref) {
-    let current
+  /** Run `task` after every earlier rotation of the same ref has finished. */
+  function withLock(ref, task) {
+    const previous = locks.get(ref) ?? Promise.resolve()
+    const run = previous.then(task, task)
+    const tail = run.then(() => undefined, () => undefined)
+    locks.set(ref, tail)
+    tail.then(() => {
+      if (locks.get(ref) === tail) locks.delete(ref)
+    })
+    return run
+  }
+
+  async function resolveValue(ref) {
     try {
-      current = (await credentials.resolve(ref))?.value
-    } catch (error) {
-      return { ok: false, reason: `无法读取 ${ref}: ${messageOf(error)}` }
+      const value = (await credentials.resolve(ref))?.value
+      return typeof value === 'string' && value.length > 0 ? value : undefined
+    } catch {
+      return undefined
     }
-    const candidates = []
-    for (const alt of cfg.alternateKeyRefs) {
-      if (alt && alt !== ref && !candidates.includes(alt)) candidates.push(alt)
+  }
+
+  /** Pool in rotation order: the backed-up original first, then the configured alternates. */
+  async function loadPool(cfg, ref) {
+    const refs = []
+    if (cfg.keepOriginalKey) refs.push(backupRefFor(ref))
+    for (const alt of cfg.alternateKeyRefs) if (alt !== ref && !refs.includes(alt)) refs.push(alt)
+    const pool = []
+    for (const poolRef of refs) {
+      const value = await resolveValue(poolRef)
+      if (value === undefined) continue
+      const fp = fingerprint(value)
+      if (pool.some((entry) => entry.fp === fp)) continue
+      pool.push({ ref: poolRef, fp, value })
     }
-    if (candidates.length === 0) return { ok: false, reason: '未配置备用密钥引用' }
-    for (const alt of candidates) {
-      let value
-      try {
-        value = (await credentials.resolve(alt))?.value
-      } catch {
-        continue
+    return pool
+  }
+
+  /**
+   * Rotate `ref` away from the key that just failed. Serialized per ref.
+   * Result: { ok: true, keyRef, target } | { ok: true, raced: true } |
+   *         { ok: false, reason, readyAt? }  (readyAt: when the earliest key comes off cooldown)
+   */
+  function rotate(cfg, ref, state, cooldownMs) {
+    return withLock(ref, async () => {
+      const now = Date.now()
+      const current = await resolveValue(ref)
+      const currentFp = current === undefined ? undefined : fingerprint(current)
+
+      const last = lastRotation.get(ref)
+      if (last && now - last.at < ROTATE_GRACE_MS && last.toFp === currentFp && state.graceFor !== last.id) {
+        state.graceFor = last.id
+        return { ok: true, raced: true }
       }
-      if (typeof value !== 'string' || value.length === 0) continue
-      if (value === current) continue
+
+      if (currentFp) cooldowns.set(currentFp, Math.max(cooldowns.get(currentFp) ?? 0, now + cooldownMs))
+
+      let pool = await loadPool(cfg, ref)
+      const hasAlternates = pool.some((entry) => entry.ref !== backupRefFor(ref))
+      if (cfg.keepOriginalKey && hasAlternates && current !== undefined && !pool.some((entry) => entry.fp === currentFp)) {
+        // The key in use is not in the pool (the user's own key): keep a copy before overwriting it,
+        // so it rejoins the rotation once its window refreshes.
+        const backupRef = backupRefFor(ref)
+        try {
+          await credentials.set(backupRef, current)
+          pool = [{ ref: backupRef, fp: currentFp, value: current }, ...pool.filter((entry) => entry.ref !== backupRef)]
+          record('info', { action: 'original-saved', keyRef: backupRef, note: `轮换前把 ${ref} 的原值保存到 ${backupRef}` })
+        } catch (error) {
+          return { ok: false, reason: `无法备份原密钥到 ${backupRef}: ${messageOf(error)}` }
+        }
+      }
+
+      const choice = pickNext(pool, currentFp, cooldowns, now)
+      if (!choice.pick) {
+        if (choice.readyAt === undefined) return { ok: false, reason: '未配置可用的备用密钥' }
+        return { ok: false, reason: '密钥池中的密钥都在冷却中', readyAt: choice.readyAt }
+      }
       try {
-        await credentials.set(ref, value)
+        await credentials.set(ref, choice.pick.value)
       } catch (error) {
         return { ok: false, reason: `无法写入 ${ref}: ${messageOf(error)}` }
       }
-      return { ok: true, keyRef: alt, target: ref }
+      lastRotation.set(ref, { id: randomUUID(), at: Date.now(), toFp: choice.pick.fp })
+      return { ok: true, keyRef: choice.pick.ref, target: ref }
+    })
+  }
+
+  /** After waiting out a full pool, put the first key that is off cooldown back into `ref`. */
+  function restoreReady(cfg, ref) {
+    return withLock(ref, async () => {
+      // Timers may fire a millisecond before Date.now() reaches the cooldown end; allow for that.
+      const now = Date.now() + CLOCK_SLOP_MS
+      const current = await resolveValue(ref)
+      const currentFp = current === undefined ? undefined : fingerprint(current)
+      if (currentFp && (cooldowns.get(currentFp) ?? 0) <= now) return undefined
+      const pool = await loadPool(cfg, ref)
+      const choice = pickNext(pool, currentFp, cooldowns, now)
+      if (!choice.pick) return undefined
+      try {
+        await credentials.set(ref, choice.pick.value)
+        lastRotation.set(ref, { id: randomUUID(), at: Date.now(), toFp: choice.pick.fp })
+        return choice.pick.ref
+      } catch {
+        return undefined
+      }
+    })
+  }
+
+  async function waitAndRetry({ agent, turn, step, provider, failure, signal }, base, delayMs, note, after) {
+    const resumeAt = new Date(Date.now() + delayMs).toISOString()
+    appendScheduled(agent, { ...base, delayMs })
+    record('info', {
+      action: 'waiting',
+      provider,
+      code: failure.code,
+      mode: 'wait',
+      retry: base.retry,
+      delayMs,
+      resumeAt,
+      note,
+    })
+
+    const completed = await wait(delayMs, fuseSignals(signal, lifetime.signal))
+    if (!completed) {
+      record('warn', {
+        action: 'aborted',
+        provider,
+        retry: base.retry,
+        note: '等待被取消（会话中止或插件卸载）',
+      })
+      // `undefined` is DSH's "do not retry" action.
+      return undefined
     }
-    return { ok: false, reason: `备用密钥均未配置或与当前 ${ref} 相同` }
+    if (after) await after()
+
+    appendStarted(agent, { retryId: base.retryId, turn, step, retry: base.retry })
+    record('info', {
+      action: 'resumed',
+      provider,
+      retry: base.retry,
+      delayMs,
+      note: '限额窗口已刷新，自动继续',
+    })
+    return { kind: 'retry' }
   }
 
   async function handle(payload, next) {
@@ -358,6 +482,18 @@ export function apply(ctx, config = {}) {
 
     const cfg = readConfig()
     if (cfg.guardedProviders.length > 0 && !cfg.guardedProviders.includes(provider)) return next()
+
+    const quota = isQuotaFailure(failure)
+    // Waiting does not refill a balance; only a different key can help.
+    if (quota && cfg.mode === 'wait' && !cfg.waitOnQuota) {
+      record('warn', {
+        action: 'quota-handoff',
+        provider,
+        code: failure.code,
+        note: '额度/余额已耗尽，等待不会恢复，交回默认处理',
+      })
+      return next()
+    }
 
     prune()
     const stateKey = `${agent?.session?.id ?? 'unknown'}:${turn}:${step}`
@@ -381,9 +517,17 @@ export function apply(ctx, config = {}) {
     }
     state.count += 1
     const retry = state.count
-    const retryId = state.retryId
-    const scheduledFailure = normalizeFailure(failure)
-    const maxRetries = cfg.maxAttempts
+    const base = {
+      retryId: state.retryId,
+      turn,
+      step,
+      provider,
+      mode: 'normal',
+      policyKey: 'rate-limit-guard',
+      retry,
+      maxRetries: cfg.maxAttempts,
+      failure: normalizeFailure(failure),
+    }
 
     record('info', {
       action: 'detected',
@@ -393,112 +537,54 @@ export function apply(ctx, config = {}) {
       note: failure.message ? truncate(failure.message, 140) : undefined,
     })
 
+    const { delayMs, source } = computeDelay(failure, cfg)
+    const delayNote = source === 'retry-after'
+      ? '使用服务端建议的等待时长'
+      : source === 'message-hint'
+        ? '从错误信息中解析出等待时长'
+        : undefined
+    const fallback = quota && !cfg.waitOnQuota ? false : cfg.fallbackToWait
+
     if (cfg.mode === 'rotate') {
       if (!credentials) {
         record('warn', {
           action: 'rotate-unavailable',
           provider,
           retry,
-          note: `credentials 服务不可用${cfg.fallbackToWait ? '，回退为等待' : '，交回后续处理器'}`,
+          note: `credentials 服务不可用${fallback ? '，回退为等待' : '，交回后续处理器'}`,
         })
-        if (!cfg.fallbackToWait) return next()
+        if (!fallback) return next()
       } else {
         const ref = resolveRef(provider, cfg)
-        const outcome = await rotate(cfg, ref)
+        const cooldownMs = quota ? cfg.quotaCooldownMinutes * 60_000 : delayMs
+        const outcome = await rotate(cfg, ref, state, cooldownMs)
         if (outcome.ok) {
-          appendScheduled(agent, {
-            retryId,
-            turn,
-            step,
-            provider,
-            mode: 'normal',
-            policyKey: 'rate-limit-guard',
-            retry,
-            maxRetries,
-            delayMs: 0,
-            failure: scheduledFailure,
-          })
-          appendStarted(agent, { retryId, turn, step, retry })
-          record('info', {
-            action: 'rotated',
-            provider,
-            retry,
-            keyRef: outcome.target,
-            note: `使用 ${outcome.keyRef} 的值立即重试`,
-          })
+          appendScheduled(agent, { ...base, delayMs: 0 })
+          appendStarted(agent, { retryId: base.retryId, turn, step, retry })
+          record('info', outcome.raced
+            ? { action: 'rotate-raced', provider, retry, note: '失败请求很可能还在用旧密钥，直接用新密钥重试' }
+            : { action: 'rotated', provider, retry, keyRef: outcome.target, note: `使用 ${outcome.keyRef} 的值立即重试` })
           return { kind: 'retry' }
         }
         record('warn', {
           action: 'rotate-unavailable',
           provider,
           retry,
-          note: `${outcome.reason}${cfg.fallbackToWait ? '，回退为等待' : '，交回后续处理器'}`,
+          note: `${outcome.reason}${fallback ? '，回退为等待' : '，交回后续处理器'}`,
         })
-        if (!cfg.fallbackToWait) return next()
+        if (!fallback) return next()
+        if (outcome.readyAt !== undefined) {
+          // Every key is cooling: wait for the first one to come back instead of hammering the pool.
+          const untilReady = Math.max(0, Math.min(outcome.readyAt - Date.now(), cfg.maxWaitSeconds * 1000))
+          return waitAndRetry(payload, base, Math.round(untilReady), '等待最早恢复的密钥', async () => {
+            const restored = await restoreReady(cfg, ref)
+            if (restored) record('info', { action: 'rotated', provider, retry, keyRef: ref, note: `等待后改用 ${restored}` })
+          })
+        }
       }
     }
 
-    let delayMs = cfg.waitSeconds * 1000
-    let delaySource = 'default'
-    const retryAfter = failure.providerRetryAfterMs
-    const hintMs = parseRetryHint(failure.message)
-    if (cfg.useRetryAfter && Number.isFinite(retryAfter) && retryAfter > 0) {
-      delayMs = retryAfter
-      delaySource = 'retry-after'
-    } else if (cfg.useRetryAfter && Number.isFinite(hintMs) && hintMs > 0) {
-      delayMs = hintMs
-      delaySource = 'message-hint'
-    }
-    delayMs = Math.min(Math.max(0, delayMs), cfg.maxWaitSeconds * 1000)
-    const resumeAt = new Date(Date.now() + delayMs).toISOString()
-
-    appendScheduled(agent, {
-      retryId,
-      turn,
-      step,
-      provider,
-      mode: 'normal',
-      policyKey: 'rate-limit-guard',
-      retry,
-      maxRetries,
-      delayMs,
-      failure: scheduledFailure,
-    })
-    record('info', {
-      action: 'waiting',
-      provider,
-      code: failure.code,
-      mode: 'wait',
-      retry,
-      delayMs,
-      resumeAt,
-      note: delaySource === 'retry-after'
-        ? '使用服务端建议的等待时长'
-        : delaySource === 'message-hint'
-          ? '从错误信息中解析出等待时长'
-          : undefined,
-    })
-
-    const completed = await wait(delayMs, fuseSignals(signal, lifetime.signal))
-    if (!completed) {
-      record('warn', {
-        action: 'aborted',
-        provider,
-        retry,
-        note: '等待被取消（会话中止或插件卸载）',
-      })
-      return undefined
-    }
-
-    appendStarted(agent, { retryId, turn, step, retry })
-    record('info', {
-      action: 'resumed',
-      provider,
-      retry,
-      delayMs,
-      note: '限额窗口已刷新，自动继续',
-    })
-    return { kind: 'retry' }
+    return waitAndRetry(payload, base, delayMs, delayNote)
   }
 
   ctx.effect(() => {
@@ -518,6 +604,8 @@ export function apply(ctx, config = {}) {
       off()
       lifetime.abort()
       attempts.clear()
+      cooldowns.clear()
+      lastRotation.clear()
     }
   }, 'rate-limit-guard: request-error listener')
 

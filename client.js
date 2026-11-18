@@ -44,6 +44,10 @@ window.__ModuleLoader__.load({
         useRetryAfterHint: '读取响应中的 retry-after；缺失时回退到默认等待时长。',
         maxWaitSeconds: '单次等待上限（秒）',
         maxWaitSecondsHint: '超过上限的等待会截断到这个值，避免长时间停住。',
+        jitter: '加入随机抖动',
+        jitterHint: '在等待时长上随机增加最多 10%（不超过 5 秒），避免多个会话同时重试。',
+        waitOnQuota: '额度耗尽时也等待',
+        waitOnQuotaHint: '默认关闭：QUOTA / ACCOUNT_QUOTA 表示余额或额度用完，等待无法恢复，会直接交回默认处理。',
         maxAttempts: '每步骤最多重试次数',
         maxAttemptsHint: '达到上限后交回默认重试策略，避免无限等待。',
         keysTitle: '密钥池',
@@ -51,7 +55,12 @@ window.__ModuleLoader__.load({
         credentialRef: '目标密钥引用',
         credentialRefHint: '提供方实际读取的引用，例如 DEEPSEEK_API_KEY 或 SHUSHENG_API_KEY。',
         alternates: '备用密钥引用',
-        alternatesHint: '每行一个。轮换时选择第一个已配置且与当前值不同的密钥。',
+        alternatesHint: '每行一个。按顺序轮流使用，跳过正在冷却（刚被限流）的密钥。',
+        keepOriginalKey: '轮换前备份原密钥',
+        keepOriginalKeyHint: '第一次换走不在池中的密钥时，把它保存到 <目标引用>_RLG_ORIGINAL，并让它参与后续轮换，原密钥不会丢失。',
+        quotaCooldownMinutes: '额度耗尽的密钥冷却（分钟）',
+        quotaCooldownMinutesHint: 'QUOTA / ACCOUNT_QUOTA 的密钥在这段时间内不会再被选中。',
+        invalidRefs: '引用名称只能包含字母、数字和下划线，且不能以数字开头',
         providerRefs: '按提供方映射（provider=引用）',
         providerRefsHint: '可选，每行一条，例如 deepseek-api-key=DEEPSEEK_API_KEY。未匹配的提供方使用目标密钥引用。',
         fallbackToWait: '没有可用备用密钥时改为等待',
@@ -100,6 +109,10 @@ window.__ModuleLoader__.load({
         useRetryAfterHint: 'Uses the response hint when present, otherwise the default wait.',
         maxWaitSeconds: 'Wait cap (seconds)',
         maxWaitSecondsHint: 'Longer waits are truncated to this value.',
+        jitter: 'Add random jitter',
+        jitterHint: 'Adds up to 10 % (at most 5 s) to each wait so sessions do not all retry at once.',
+        waitOnQuota: 'Wait on exhausted quota too',
+        waitOnQuotaHint: 'Off by default: QUOTA / ACCOUNT_QUOTA means the balance or quota is used up, so waiting cannot help and the failure is handed back.',
         maxAttempts: 'Retries per step',
         maxAttemptsHint: 'After this cap the ordinary retry policy takes over.',
         keysTitle: 'Key pool',
@@ -107,7 +120,12 @@ window.__ModuleLoader__.load({
         credentialRef: 'Target credential reference',
         credentialRefHint: 'The reference the provider actually reads, e.g. DEEPSEEK_API_KEY or SHUSHENG_API_KEY.',
         alternates: 'Pool references',
-        alternatesHint: 'One per line. Rotation picks the first configured value that differs from the current one.',
+        alternatesHint: 'One per line. Keys are used in turn; keys still cooling down after a limit are skipped.',
+        keepOriginalKey: 'Back up the original key before rotating',
+        keepOriginalKeyHint: 'The first time a key outside the pool is rotated away, it is saved to <target>_RLG_ORIGINAL and joins the rotation, so it is never lost.',
+        quotaCooldownMinutes: 'Cooldown for exhausted keys (minutes)',
+        quotaCooldownMinutesHint: 'A key that returned QUOTA / ACCOUNT_QUOTA is not picked again for this long.',
+        invalidRefs: 'Reference names may only contain letters, digits and underscores, and must not start with a digit',
         providerRefs: 'Provider mapping (provider=ref)',
         providerRefsHint: 'Optional, one per line, e.g. deepseek-api-key=DEEPSEEK_API_KEY. Unmatched providers use the target reference.',
         fallbackToWait: 'Wait when no pool key is usable',
@@ -200,6 +218,17 @@ window.__ModuleLoader__.load({
       return out
     }
 
+    const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+    function invalidRefsOf(draft) {
+      const refs = [String(draft.credentialRef ?? '').trim(), ...splitList(draft.alternateKeyRefs)]
+      for (const mapping of splitList(draft.providerRefs)) {
+        const separator = mapping.indexOf('=')
+        refs.push(separator > 0 ? mapping.slice(separator + 1).trim() : mapping)
+      }
+      return refs.filter((ref) => ref !== '' && !REF_PATTERN.test(ref))
+    }
+
     function refsOf(value) {
       if (!value) return []
       const out = []
@@ -207,6 +236,9 @@ window.__ModuleLoader__.load({
         if (typeof ref === 'string' && ref.trim() !== '' && !out.includes(ref.trim())) out.push(ref.trim())
       }
       push(value.credentialRef)
+      if (value.keepOriginalKey && typeof value.credentialRef === 'string' && value.credentialRef.trim() !== '') {
+        push(`${value.credentialRef.trim()}_RLG_ORIGINAL`)
+      }
       for (const ref of splitList(value.alternateKeyRefs)) push(ref)
       for (const mapping of splitList(value.providerRefs)) {
         const separator = mapping.indexOf('=')
@@ -227,6 +259,10 @@ window.__ModuleLoader__.load({
         alternateKeyRefs: Array.isArray(v.alternateKeyRefs) ? v.alternateKeyRefs.join('\n') : '',
         providerRefs: Array.isArray(v.providerRefs) ? v.providerRefs.join('\n') : '',
         fallbackToWait: v.fallbackToWait !== false,
+        jitter: v.jitter !== false,
+        waitOnQuota: v.waitOnQuota === true,
+        quotaCooldownMinutes: String(v.quotaCooldownMinutes ?? 60),
+        keepOriginalKey: v.keepOriginalKey !== false,
         guardedProviders: Array.isArray(v.guardedProviders) ? v.guardedProviders.join(', ') : '',
       }
     }
@@ -248,6 +284,10 @@ window.__ModuleLoader__.load({
         { op: 'set', path: ['alternateKeyRefs'], value: splitList(draft.alternateKeyRefs) },
         { op: 'set', path: ['providerRefs'], value: splitList(draft.providerRefs) },
         { op: 'set', path: ['fallbackToWait'], value: draft.fallbackToWait === true },
+        { op: 'set', path: ['jitter'], value: draft.jitter === true },
+        { op: 'set', path: ['waitOnQuota'], value: draft.waitOnQuota === true },
+        { op: 'set', path: ['quotaCooldownMinutes'], value: numberOr(draft.quotaCooldownMinutes, 60, 1, 10080) },
+        { op: 'set', path: ['keepOriginalKey'], value: draft.keepOriginalKey === true },
         { op: 'set', path: ['guardedProviders'], value: splitList(draft.guardedProviders) },
       ]
     }
@@ -392,6 +432,11 @@ window.__ModuleLoader__.load({
 
       const save = async () => {
         if (!writable) return
+        const invalid = invalidRefsOf(draft)
+        if (invalid.length > 0) {
+          setNotice({ kind: 'error', text: `${t('invalidRefs')}: ${invalid.join(', ')}` })
+          return
+        }
         setBusy(true)
         setNotice({ kind: 'busy', text: t('saving') })
         try {
@@ -432,6 +477,14 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const checkRow = (field) => h(Row, { label: t(field), hint: t(`${field}Hint`) },
+        h(Check, {
+          checked: draft[field],
+          disabled: !writable,
+          label: t(field),
+          onChange: (checked) => update({ [field]: checked }),
+        }))
+
       const numberInput = (field, min, max) => h('input', {
         className: 'rlg-input rlg-input-num',
         type: 'number',
@@ -469,7 +522,7 @@ window.__ModuleLoader__.load({
               h('span', { className: 'rlg-seg-title' }, t('modeRotate')),
               h('span', { className: 'rlg-seg-desc' }, t('modeRotateDesc'))))),
 
-        mode === 'wait' ? h(Card, { title: t('waitTitle'), desc: t('waitDesc') },
+        mode === 'wait' || draft.fallbackToWait ? h(Card, { title: t('waitTitle'), desc: t('waitDesc') },
           h(Row, { label: t('waitSeconds'), hint: t('waitSecondsHint') }, numberInput('waitSeconds', 1, 86400)),
           h(Row, { label: t('useRetryAfter'), hint: t('useRetryAfterHint') },
             h(Check, {
@@ -478,7 +531,9 @@ window.__ModuleLoader__.load({
               label: t('useRetryAfter'),
               onChange: (checked) => update({ useRetryAfter: checked }),
             })),
-          h(Row, { label: t('maxWaitSeconds'), hint: t('maxWaitSecondsHint') }, numberInput('maxWaitSeconds', 1, 86400))) : null,
+          h(Row, { label: t('maxWaitSeconds'), hint: t('maxWaitSecondsHint') }, numberInput('maxWaitSeconds', 1, 86400)),
+          checkRow('jitter'),
+          checkRow('waitOnQuota')) : null,
 
         h(Card, { title: t('keysTitle'), desc: t('keysDesc') },
           h(Row, { label: t('credentialRef'), hint: t('credentialRefHint') },
@@ -520,6 +575,9 @@ window.__ModuleLoader__.load({
             busy: busyKey === reference,
             disabled: !writable || busyKey !== null,
           }))) : null,
+          mode === 'rotate' ? checkRow('keepOriginalKey') : null,
+          mode === 'rotate' ? h(Row, { label: t('quotaCooldownMinutes'), hint: t('quotaCooldownMinutesHint') },
+            numberInput('quotaCooldownMinutes', 1, 10080)) : null,
           mode === 'rotate' ? h(Row, { label: t('fallbackToWait'), hint: t('fallbackToWaitHint') },
             h(Check, {
               checked: draft.fallbackToWait,
