@@ -21,12 +21,25 @@ log, and through a `/ratelimit-log` command.
   - **Wait** — a configurable timer (default 60 s), optionally overridden by the provider's
     `retry-after` hint or a delay parsed from the error message, then the same step is
     retried automatically with its context intact.
-  - **Rotate key** — picks the first configured alternate credential whose value differs
-    from the one currently in use, writes it into the provider's credential reference, and
-    retries immediately. DSH resolves credentials per request, so the next attempt uses the
-    new key without a restart.
+  - **Rotate key** — moves to the next key in the pool (round-robin), writes it into the
+    provider's credential reference, and retries immediately. DSH resolves credentials per
+    request, so the next attempt uses the new key without a restart.
+    - The key that was in use before the first rotation is backed up to
+      `<REF>_RLG_ORIGINAL` and stays in the rotation, so it is never lost.
+    - A key that was just limited cools down (for the retry-after / hinted / default wait,
+      or `quotaCooldownMinutes` for exhausted quota) and is skipped meanwhile; when every
+      key is cooling, the guard waits for the first one to come back instead of hammering
+      the pool with zero-delay retries.
+    - Rotations of one reference are serialized, and a failure that arrives within 5 s of a
+      rotation is retried once on the new key without rotating again, so concurrent
+      sessions do not skip keys.
 - **Guards the right failures** — `RATE_LIMIT`, `HTTP_429`, `QUOTA` and `ACCOUNT_QUOTA`
-  (PRM/TPM limits and account/balance exhaustion).
+  (PRM/TPM limits and account/balance exhaustion). Exhausted quota (`QUOTA`,
+  `ACCOUNT_QUOTA`) is never waited out by default, since waiting cannot refill a balance:
+  rotate mode moves to another key, and otherwise the failure goes straight back to DSH.
+- **Hint parsing in English and Chinese** — `retry after 30s`, `try again in 1m30s`,
+  `resets in 6m0s`, `请在 30 秒后重试`, `1分30秒后重试`; waits get up to 10 % (max 5 s)
+  jitter so sessions limited together do not retry together.
 - **Auto-resume, not auto-fail** — returns `retry` for the current step of the agent loop;
   no restart, no lost turn.
 - **Bounded retries** — a per-step attempt cap (default 12) hands control back to the
@@ -91,7 +104,7 @@ half (`index.js`) and a client half (`client.js`).
    bundle to this directory, so deleting it breaks the plugin):
 
    ```bash
-   git clone https://github.com/<you>/dsh-rate-limit-guard.git
+   git clone https://github.com/ChuQing-debug/dsh-rate-limit-guard.git
    ```
 
 2. In DSH, open **Plugin Manager → Install bundle** and choose the absolute path of the
@@ -126,9 +139,13 @@ next request. Values can also be supplied in the bundle's patch `config:` block.
 | `useRetryAfter` | `true` | Prefer `providerRetryAfterMs`, then a delay parsed from the error message (e.g. `retry after 30s`), then `waitSeconds`. |
 | `maxWaitSeconds` | `900` | Upper bound for any single wait. |
 | `maxAttempts` | `12` | Per-step retry cap; after this the failure goes back to the default policy. |
+| `jitter` | `true` | Add up to 10 % (at most 5 s) to each wait. |
+| `waitOnQuota` | `false` | Also wait on `QUOTA` / `ACCOUNT_QUOTA` (the previous behaviour). |
+| `quotaCooldownMinutes` | `60` | How long a key that returned exhausted quota is skipped in rotate mode. |
 | `credentialRef` | `DEEPSEEK_API_KEY` | The credential reference the provider reads and that rotation writes to. |
 | `alternateKeyRefs` | `[]` | Credential references that form the key pool. Only reference names are stored here. |
 | `providerRefs` | `[]` | Optional `provider=REFERENCE` lines for providers that read different references. |
+| `keepOriginalKey` | `true` | Before the first rotation away from a key that is not in the pool, save it to `<REF>_RLG_ORIGINAL` and rotate through it too. |
 | `fallbackToWait` | `true` | When rotation is impossible, wait instead of handing the failure back. |
 | `guardedProviders` | `[]` | Allowlist of providers to guard; empty means all. |
 
@@ -147,7 +164,8 @@ each reference and writes new values through DSH's credentials service:
 4. If providers map to different references, add lines like `shusheng=SHUSHENG_API_KEY`
    under **Provider mapping** so rotation targets the right one.
 
-Reference names must match `^[A-Za-z_][A-Za-z0-9_]*$`. Values come from the credentials
+Reference names must match `^[A-Za-z_][A-Za-z0-9_]*$`; the settings page refuses to save
+other names and the host ignores them. Values come from the credentials
 service (a stored value outranks the launch environment), so a rotation takes effect on the
 very next request.
 
@@ -175,9 +193,12 @@ very next request.
 - **Account-login providers** (`deepseek-account`, OAuth-style routes) have no API key to
   rotate. In rotate mode the guard logs the reason and falls back to waiting (unless
   `fallbackToWait` is off).
-- **In-memory budget and log.** Attempt counters and the 200-entry log ring are per process
-  and reset when the plugin reloads or the app restarts. The durable report is the
+- **In-memory budget, cooldowns and log.** Attempt counters, key cooldowns and the 200-entry
+  log ring are per process and reset when the plugin reloads or the app restarts. Key
+  cooldowns store a SHA-256 fingerprint, never the key. The durable report is the
   `llm/retry` event in the session.
+- **Rotation is global.** The target reference is shared, so a rotation affects every
+  session that reads it, which is also why rotations are serialized.
 - **A retry is a new request.** Waiting keeps the conversation and generated context, but
   the failed attempt itself is not resumed mid-stream.
 - **One wait at a time per step.** Aborting the session (or unloading the plugin) cancels a
@@ -189,7 +210,8 @@ very next request.
 | --- | --- |
 | Settings page says the config was not found | Plugin enabled in this profile? Restart the app and reopen Settings. |
 | No wait happened | Is the provider covered by `guardedProviders`? Was the failure code one of `RATE_LIMIT`/`HTTP_429`/`QUOTA`/`ACCOUNT_QUOTA`? |
-| No rotation happened | Are alternates configured with values different from the current one? Is the provider an account-login route? |
+| No rotation happened | Are alternates configured with values different from the current one? Is the provider an account-login route? Are all keys cooling down (`/ratelimit-log` shows the count)? |
+| Want the original key back | It is stored in `<REF>_RLG_ORIGINAL`; it rejoins the rotation automatically, or copy it back on the settings page. |
 | Save fails | Settings document is read-only, or someone edited it concurrently — click reload and save again. |
 | `/ratelimit-log` is unknown | Host half not loaded; reinstall/re-enable the bundle. |
 
@@ -200,7 +222,13 @@ dsh-rate-limit-guard/
 ├── package.json            # bundle + client manifest
 ├── cordis.patch.yml        # inserts the rate-limit-guard entry
 ├── index.js                # host: request-error listener, config, log, command
+├── lib.js                  # pure helpers: hint parsing, delays, key selection
 ├── client.js               # settings page (React, no build step)
+├── test/                   # node:test suites (host, helpers, settings page)
+├── .github/workflows/      # CI: syntax check + tests
+├── README.md
+├── LICENSE                 # MIT
+├── .gitignore
 ├── locale/
 │   ├── zh.json             # localized title / description / detail doc
 │   └── en.json
@@ -219,24 +247,20 @@ There is no build step: the client half is plain `window.__ModuleLoader__` JavaS
 the host half is ESM executed by DSH.
 
 ```bash
-node --check index.js
-node --check client.js
+npm run check   # node --check on every entry
+npm test        # node:test, no dependencies
 ```
 
-Manual verification used a small mock harness that stubs `ctx.on`, `agent.session.append`,
-`ctx.credentials`, and `ctx.inject`, then asserts:
+The suites stub only what the plugin touches (`ctx.on`, `ctx.inject`, `ctx.credentials`,
+`agent.session.append`, `window.__ModuleLoader__`, a minimal React hooks runtime) and cover:
 
-- wait mode returns `{ kind: 'retry' }` after the expected delay and appends
-  `llm/retry` followed by `llm/retry-started`;
-- a `retry after 2s` message produces a 2000 ms delay;
-- rotate mode writes the alternate value through `credentials.set` and retries with
-  `delayMs: 0`;
-- reaching `maxAttempts` calls `next()` once;
-- `/ratelimit-log` renders the mode line and recent events.
-
-The client registration was checked by stubbing `window.__ModuleLoader__` and the React
-module: one locale registration, one `settings.section` registration (id
-`rate-limit-guard`, order 40), and complete zh/en key coverage.
+- wait mode, message hints, abort and unload, the per-step cap, quota hand-off;
+- rotate mode: original-key backup, round-robin back to the original, cooldown skipping,
+  waiting for the earliest key, the post-rotation grace retry, concurrent failures,
+  invalid reference names;
+- hint parsing (English, Chinese, compound durations), delay order, jitter bounds;
+- the settings page: zh/en key parity, every rendered label present, reference validation
+  on save, the new fields written.
 
 ## 中文说明
 
@@ -246,23 +270,26 @@ module: one locale registration, one `settings.section` registration (id
 
 - **智能等待**：优先使用服务端建议的 `retry-after`，其次从错误信息解析等待时长，否则
   使用你填写的秒数；到点后自动重试同一步骤，上下文不丢。
-- **轮换密钥**：从密钥池中选第一个「已配置且与当前值不同」的引用，通过凭据服务写入
-  提供方正在读取的引用，然后立即重试；没有可用备用密钥时按配置回退为等待。
+- **轮换密钥**：按顺序轮流使用密钥池中的密钥，通过凭据服务写入提供方正在读取的引用，
+  然后立即重试。第一次换走原密钥前会把它备份到 `<引用>_RLG_ORIGINAL` 并让它参与轮换；
+  刚被限流的密钥进入冷却，全部冷却时等待最早恢复的那个；并发会话不会重复轮换。
+
+额度/余额耗尽（`QUOTA`、`ACCOUNT_QUOTA`）默认不等待：轮换模式换下一个密钥，否则直接
+交回 DSH。等待时长可从中英文错误信息解析（如「请在 30 秒后重试」），并加入随机抖动。
 
 页面上可以设置计时器、单次等待上限、每步骤重试上限、密钥池与提供方映射，并查看每个
 引用的配置状态。对话中每次等待显示倒计时行；插件日志包含时间与恢复时间；输入
 `/ratelimit-log` 查看最近事件。
 
 **限制**：一次重试只能复用同一提供方，不能中途切换提供方；账号登录型提供方
-（如 `deepseek-account`）没有可替换的 API Key，轮换会回退为等待。尝试次数与日志缓存在
-内存中，插件重载后清空。
+（如 `deepseek-account`）没有可替换的 API Key，轮换会回退为等待。尝试次数、密钥冷却与
+日志缓存在内存中（冷却只记录密钥指纹），插件重载后清空。
 
 安装：把仓库目录放在固定位置，在插件管理中选择该目录安装 bundle，重启应用后在设置页
 配置。密钥只通过 DSH 凭据服务保存，设置页仅保存引用名称并显示掩码。
 
 ## License
 
-The plugin code in this repository does not yet declare a license; add a `LICENSE` file
-(such as MIT) before publishing if you want others to reuse it. The vendored
-`schemastery` and `cosmokit` copies are MIT-licensed by their upstream author; see
-[`vendor/NOTICE.md`](vendor/NOTICE.md) for the full notices.
+The plugin code in this repository is released under the MIT License; see
+[`LICENSE`](LICENSE). The vendored `schemastery` and `cosmokit` copies are MIT-licensed by
+their upstream author; see [`vendor/NOTICE.md`](vendor/NOTICE.md) for the full notices.

@@ -1,0 +1,3 @@
+- insert:
+    - id: rate-limit-guard
+      name: dsh-rate-limit-guard
