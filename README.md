@@ -201,6 +201,9 @@ dsh-rate-limit-guard/
 ├── cordis.patch.yml        # inserts the rate-limit-guard entry
 ├── index.js                # host: request-error listener, config, log, command
 ├── client.js               # settings page (React, no build step)
+├── README.md
+├── LICENSE                 # MIT
+├── .gitignore
 ├── locale/
 │   ├── zh.json             # localized title / description / detail doc
 │   └── en.json
@@ -262,7 +265,6 @@ module: one locale registration, one `settings.section` registration (id
 
 ## License
 
-The plugin code in this repository does not yet declare a license; add a `LICENSE` file
-(such as MIT) before publishing if you want others to reuse it. The vendored
-`schemastery` and `cosmokit` copies are MIT-licensed by their upstream author; see
-[`vendor/NOTICE.md`](vendor/NOTICE.md) for the full notices.
+The plugin code in this repository is released under the MIT License; see
+[`LICENSE`](LICENSE). The vendored `schemastery` and `cosmokit` copies are MIT-licensed by
+their upstream author; see [`vendor/NOTICE.md`](vendor/NOTICE.md) for the full notices.

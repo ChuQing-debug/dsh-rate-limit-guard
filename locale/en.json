@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Rate limit guard",
+    "description": "Wait out a provider rate limit or rotate to the next API key, then resume the interrupted step automatically.",
+    "detail": "docs/DETAIL.md"
+  }
+}
