@@ -50,6 +50,23 @@ export function isNoRotateMarker(value) {
   return value === '' || value === '-'
 }
 
+/** Whether the operator mapped `provider` by hand, so discovery must not override the intent. */
+export function hasMapping(provider, mappings) {
+  for (const item of mappings) {
+    const separator = item.indexOf('=')
+    if (separator <= 0) continue
+    if (item.slice(0, separator).trim() === provider) return true
+  }
+  return false
+}
+
+/** The reference a provider profile declares through `apiKeyEnv`, when it is a usable one. */
+export function declaredKeyRef(profile) {
+  if (!profile || typeof profile !== 'object') return undefined
+  const ref = profile.apiKeyEnv
+  return typeof ref === 'string' && isValidRef(ref) ? ref : undefined
+}
+
 /**
  * Which credential reference rotation should write for `provider`, or undefined when the provider has
  * no rotatable key. `mappings` are `provider=REFERENCE` lines; an invalid reference falls back to the default.

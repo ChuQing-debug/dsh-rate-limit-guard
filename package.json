@@ -1,6 +1,6 @@
 {
   "name": "dsh-rate-limit-guard",
-  "version": "0.3.1",
+  "version": "0.5.0",
   "description": "Wait out provider rate limits or rotate to another API key, with a settings UI and an event log.",
   "license": "MIT",
   "repository": {

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { computeDelay, fingerprint, isAuthFailure, isValidRef, parseDuration, parseRetryHint, pickNext, refForProvider } from '../lib.js'
+import { computeDelay, declaredKeyRef, fingerprint, hasMapping, isAuthFailure, isValidRef, parseDuration, parseRetryHint, pickNext, refForProvider } from '../lib.js'
 
 test('parseRetryHint reads English hints', () => {
   assert.equal(parseRetryHint('Rate limit reached. Please retry after 30s.'), 30_000)
@@ -174,4 +174,20 @@ test('isAuthFailure: 403 in other shapes is still not a rejected key', () => {
   assert.ok(!isAuthFailure({ code: 'AUTH', message: 'HTTP 403 Forbidden: model not allowed' }))
   assert.ok(!isAuthFailure({ code: 'AUTH', status: '403', message: 'forbidden' }))
   assert.ok(isAuthFailure({ code: 'AUTH', message: 'HTTP 401 Unauthorized' }))
+})
+
+test('hasMapping only reports a hand-written mapping for that provider', () => {
+  assert.equal(hasMapping('openrouter', ['openrouter=KEY_A']), true)
+  assert.equal(hasMapping('openrouter', ['openrouter=-']), true)
+  assert.equal(hasMapping('openrouter', ['other=KEY_A']), false)
+  assert.equal(hasMapping('openrouter', []), false)
+  assert.equal(hasMapping('openrouter', ['bogus', '=KEY_A']), false)
+})
+
+test('declaredKeyRef reads apiKeyEnv only when it is a usable reference', () => {
+  assert.equal(declaredKeyRef({ apiKeyEnv: 'OPENROUTER_API_KEY' }), 'OPENROUTER_API_KEY')
+  assert.equal(declaredKeyRef({ apiKeyEnv: 'not a ref' }), undefined)
+  assert.equal(declaredKeyRef({ apiKeyEnv: 42 }), undefined)
+  assert.equal(declaredKeyRef({}), undefined)
+  assert.equal(declaredKeyRef(undefined), undefined)
 })

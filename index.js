@@ -15,7 +15,9 @@ import z from './vendor/schemastery.mjs'
 import {
   backupRefFor,
   computeDelay,
+  declaredKeyRef,
   fingerprint,
+  hasMapping,
   isAuthFailure,
   isQuotaFailure,
   isRateLimitFailure,
@@ -257,6 +259,8 @@ export function apply(ctx, config = {}) {
   /** target ref -> tail of the promise chain that serializes rotations of that ref */
   const locks = new Map()
   let credentials
+  let llm
+  let settings
 
   /** Pick the Chinese or English text for log notes and the /ratelimit-log report. */
   function language() {
@@ -272,8 +276,18 @@ export function apply(ctx, config = {}) {
     }, 'rate-limit-guard: credentials handle')
   })
 
+  // The official provider directory, the same source the desktop model settings page reads. A
+  // provider that the operator did not map by hand rotates the reference its own profile declares.
+  ctx.inject(['llm'], (sub) => {
+    llm = sub.llm
+    sub.effect(() => () => {
+      llm = undefined
+    }, 'rate-limit-guard: llm handle')
+  })
+
   // The plugin ships its own settings page, so hide the auto-generated one.
   ctx.inject(['settings'], (sub) => {
+    settings = sub.settings
     try {
       sub.settings.configure({ auto: false }, ctx.fiber)
     } catch (error) {
@@ -284,6 +298,11 @@ export function apply(ctx, config = {}) {
   function readConfig() {
     const mode = readField(config.mode, 'wait') === 'rotate' ? 'rotate' : 'wait'
     const credentialRef = String(readField(config.credentialRef, 'DEEPSEEK_API_KEY') || '').trim()
+    const targetRef = isValidRef(credentialRef) ? credentialRef : 'DEEPSEEK_API_KEY'
+    // The rotation target can never sit in its own pool: the desktop picker writes every ticked
+    // reference straight into this list, so dropping it here keeps a stale file harmless.
+    const alternateKeyRefs = [...new Set(readStrings(config.alternateKeyRefs).filter(isValidRef))]
+      .filter((ref) => ref !== targetRef)
     return {
       mode,
       waitSeconds: readNumber(config.waitSeconds, 60, 1, 86400),
@@ -295,8 +314,8 @@ export function apply(ctx, config = {}) {
       jitter: readBoolean(config.jitter, true),
       waitOnQuota: readBoolean(config.waitOnQuota, false),
       quotaCooldownMinutes: readNumber(config.quotaCooldownMinutes, 60, 1, 7 * 24 * 60),
-      credentialRef: isValidRef(credentialRef) ? credentialRef : 'DEEPSEEK_API_KEY',
-      alternateKeyRefs: readStrings(config.alternateKeyRefs).filter(isValidRef),
+      credentialRef: targetRef,
+      alternateKeyRefs,
       providerRefs: readStrings(config.providerRefs),
       keepOriginalKey: readBoolean(config.keepOriginalKey, true),
       fallbackToWait: readBoolean(config.fallbackToWait, true),
@@ -306,8 +325,54 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /** How long a provider-to-reference snapshot from the directory stays usable. */
+  const DIRECTORY_TTL_MS = 30_000
+  /** provider -> reference declared by its profile, refreshed on demand. */
+  let directoryRefs
+  let directoryAt = 0
+
+  /** Read `path` from `value`, tolerating missing links. */
+  function getPath(value, path) {
+    let node = value
+    for (const key of path) {
+      if (node === null || typeof node !== 'object') return undefined
+      node = node[key]
+    }
+    return node
+  }
+
+  /**
+   * Refresh the map from provider ids to the references their profiles declare. Both inputs come from
+   * official services: the LLM directory names each provider profile, and the settings forms carry
+   * the profile values, so `apiKeyEnv` here is exactly the reference that provider resolves.
+   */
+  function loadDirectory() {
+    const now = Date.now()
+    if (directoryRefs !== undefined && now - directoryAt <= DIRECTORY_TTL_MS) return directoryRefs
+    directoryAt = now
+    directoryRefs = new Map()
+    try {
+      const entries = typeof llm?.listConfigurableProviders === 'function' ? llm.listConfigurableProviders() : []
+      const views = typeof settings?.describe === 'function' ? settings.describe({ redactSecrets: true }) : []
+      const namespaces = new Map((views ?? []).map((view) => [view.ns, view]))
+      for (const entry of entries ?? []) {
+        if (!entry || typeof entry.provider !== 'string') continue
+        const profile = getPath(namespaces.get(entry.settingsNs)?.value, entry.settingsPath ?? [])
+        const ref = declaredKeyRef(profile)
+        if (ref) directoryRefs.set(entry.provider, ref)
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`rate-limit-guard: provider directory unavailable: ${messageOf(error)}`)
+    }
+    return directoryRefs
+  }
+
   /** The reference rotation writes for `provider`; undefined when that provider has no key to rotate. */
-  function resolveRef(provider, cfg) {
+  async function resolveRef(provider, cfg) {
+    if (!hasMapping(provider, cfg.providerRefs)) {
+      const discovered = loadDirectory().get(provider)
+      if (discovered) return discovered
+    }
     return refForProvider(provider, cfg.providerRefs, cfg.credentialRef)
   }
 
@@ -365,15 +430,18 @@ export function apply(ctx, config = {}) {
     return `${label}${bits.length ? ` · ${bits.join(' · ')}` : ''}`
   }
 
-  /** Target references rotation can write: the default one plus every mapped one. */
-  function targetRefs(cfg) {
+  /** Target references rotation can write: the default one, every mapped one, and each provider's own. */
+  async function targetRefs(cfg) {
     const refs = [cfg.credentialRef]
+    const include = (ref) => {
+      if (isValidRef(ref) && !refs.includes(ref)) refs.push(ref)
+    }
     for (const item of cfg.providerRefs) {
       const separator = item.indexOf('=')
       if (separator <= 0) continue
-      const ref = item.slice(separator + 1).trim()
-      if (isValidRef(ref) && !refs.includes(ref)) refs.push(ref)
+      include(item.slice(separator + 1).trim())
     }
+    for (const ref of loadDirectory().values()) include(ref)
     return refs
   }
 
@@ -382,7 +450,7 @@ export function apply(ctx, config = {}) {
     const lines = []
     if (!credentials) return [L('凭据服务不可用，无法轮换。', 'The credentials service is unavailable; rotation is off.')]
     const now = Date.now()
-    for (const ref of targetRefs(cfg)) {
+    for (const ref of await targetRefs(cfg)) {
       const target = await readTarget(ref)
       const pool = await loadPool(cfg, ref)
       const currentFp = target.ok && target.value !== undefined ? fingerprint(target.value) : undefined
@@ -403,6 +471,7 @@ export function apply(ctx, config = {}) {
         lines.push(`    ${entry.ref}: ${state}`)
       }
       for (const slot of pool.unreadable) lines.push(`    ${slot}: ${L('读取失败', 'unreadable')}`)
+      for (const slot of pool.ignored) lines.push(L(`    ${slot}: 已忽略（该引用属于其他提供方，只能手动填写非提供方引用作为轮换槽）`, `    ${slot}: ignored (this reference belongs to another provider; only manual non-provider references can be storage slots)`))
       if (pool.length === 0) lines.push(L('    （密钥池为空）', '    (the pool is empty)'))
     }
     return lines
@@ -412,8 +481,8 @@ export function apply(ctx, config = {}) {
     const cfg = readConfig()
     const modeText = cfg.mode === 'rotate'
       ? L(
-        `轮换密钥（目标 ${cfg.credentialRef}，${cfg.alternateKeyRefs.length} 个备用引用）`,
-        `rotate key (target ${cfg.credentialRef}, ${cfg.alternateKeyRefs.length} alternate reference(s))`,
+        `轮换密钥（目标 ${cfg.credentialRef}，轮换池 ${cfg.alternateKeyRefs.length} 个引用）`,
+        `rotate key (target ${cfg.credentialRef}, ${cfg.alternateKeyRefs.length} reference(s) in the pool)`,
       )
       : L(
         `等待（默认 ${cfg.waitSeconds}s，单次上限 ${cfg.maxWaitSeconds}s）`,
@@ -540,10 +609,21 @@ export function apply(ctx, config = {}) {
   async function loadPool(cfg, ref) {
     const slots = cfg.keepOriginalKey ? [backupRefFor(ref), previousRefFor(ref)] : []
     const refs = [...slots]
-    const targets = targetRefs(cfg)
-    for (const alt of cfg.alternateKeyRefs) if (!targets.includes(alt) && !refs.includes(alt)) refs.push(alt)
+    const targets = await targetRefs(cfg)
+    // Every provider owns its own reference: writing another provider's key into it would break that
+    // provider, so those entries can never act as storage slots for this target. Keep them visible as
+    // `ignored` so the settings pages and /ratelimit-log can explain why a configured entry did nothing.
+    const ignored = []
+    for (const alt of cfg.alternateKeyRefs) {
+      if (targets.includes(alt)) {
+        if (!ignored.includes(alt)) ignored.push(alt)
+        continue
+      }
+      if (!refs.includes(alt)) refs.push(alt)
+    }
     const pool = []
     pool.unreadable = []
+    pool.ignored = ignored
     for (const poolRef of refs) {
       const read = await readTarget(poolRef)
       if (!read.ok) {
@@ -603,14 +683,20 @@ export function apply(ctx, config = {}) {
         const saved = { ref: slot, fp: currentFp, value: current }
         const rest = pool.filter((entry) => entry.ref !== slot)
         const head = rest.filter((entry) => entry.ref === backupRef)
-        pool = [...head, saved, ...rest.filter((entry) => entry.ref !== backupRef)]
+        const rebuilt = [...head, saved, ...rest.filter((entry) => entry.ref !== backupRef)]
+        rebuilt.unreadable = pool.unreadable
+        rebuilt.ignored = pool.ignored
+        pool = rebuilt
         record('info', { action: 'original-saved', keyRef: slot, note: L(`轮换前把 ${ref} 的原值保存到 ${slot}`, `saved the value of ${ref} to ${slot} before rotating`) })
       }
 
       const choice = pickNext(pool, currentFp, cooldowns, now)
       if (!choice.pick) {
-        if (choice.readyAt === undefined) return { ok: false, reason: L('未配置可用的备用密钥', 'no usable alternate key is configured') }
-        return { ok: false, reason: L('密钥池中的密钥都在冷却中', 'every key in the pool is cooling down'), readyAt: choice.readyAt }
+        const ignoredNote = pool.ignored.length > 0
+          ? L(`；已忽略其他提供方的引用 ${pool.ignored.join('、')}`, `; ignored references owned by other providers: ${pool.ignored.join(', ')}`)
+          : ''
+        if (choice.readyAt === undefined) return { ok: false, reason: L('未配置可用的备用密钥', 'no usable alternate key is configured') + ignoredNote }
+        return { ok: false, reason: L('密钥池中的密钥都在冷却中', 'every key in the pool is cooling down') + ignoredNote, readyAt: choice.readyAt }
       }
       try {
         await writeTarget(ref, choice.pick.value, currentFp)
@@ -690,28 +776,35 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  /** After waiting out a full pool, put the first key that is off cooldown back into `ref`. */
+  /**
+   * After waiting out a pool cooldown, decide what the next attempt should use:
+   * - `{ kind: 'ready' }`: the key already in the target came off cooldown, retry with it;
+   * - `{ kind: 'switched', ref }`: a pool key is ready and was written into the target;
+   * - `{ kind: 'none' }`: nothing is ready (or the target changed underneath us), do not retry.
+   * The old `undefined` result could not tell these apart, so the caller could not avoid retrying a
+   * key that was still cooling when the wait was capped by `maxWaitSeconds`.
+   */
   function restoreReady(cfg, ref, state, provider) {
     return withLock(ref, async () => {
-      if (lifetime.signal.aborted) return undefined
+      if (lifetime.signal.aborted) return { kind: 'none' }
       // Timers may fire a millisecond before Date.now() reaches the cooldown end; allow for that.
       const now = Date.now() + CLOCK_SLOP_MS
       const target = await readTarget(ref)
-      if (!target.ok) return undefined
+      if (!target.ok) return { kind: 'none' }
       const current = target.value
       const currentFp = current === undefined ? undefined : fingerprint(current)
-      if (currentFp && (cooldowns.get(currentFp) ?? 0) <= now) return undefined
+      if (currentFp && (cooldowns.get(currentFp) ?? 0) <= now) return { kind: 'ready' }
       const pool = await loadPool(cfg, ref)
       // Only replace a key that is also stored in the pool; anything else would be lost.
-      if (currentFp && !pool.some((entry) => entry.fp === currentFp)) return undefined
+      if (currentFp && !pool.some((entry) => entry.fp === currentFp)) return { kind: 'none' }
       const choice = pickNext(pool, currentFp, cooldowns, now)
-      if (!choice.pick) return undefined
+      if (!choice.pick) return { kind: 'none' }
       try {
         await writeTarget(ref, choice.pick.value, currentFp)
         noteRotation(ref, choice.pick.fp, provider, state)
-        return choice.pick.ref
+        return { kind: 'switched', ref: choice.pick.ref }
       } catch {
-        return undefined
+        return { kind: 'none' }
       }
     })
   }
@@ -762,7 +855,20 @@ export function apply(ctx, config = {}) {
       // `undefined` is DSH's "do not retry" action.
       return undefined
     }
-    if (after) await after()
+    if (after) {
+      const usable = await after()
+      if (usable === false) {
+        record('warn', {
+          action: 'pool-still-cooling',
+          provider,
+          code: failure.code,
+          retry: base.retry,
+          delayMs,
+          note: L('等待结束仍没有可用的轮换密钥，交回默认处理，避免继续用冷却中的 Key 重试', 'no rotation key became usable after the wait, handing back instead of retrying on a still-cooling key'),
+        })
+        return next()
+      }
+    }
 
     appendStarted(agent, { retryId: base.retryId, turn, step, retry: base.retry })
     record('info', {
@@ -822,7 +928,7 @@ export function apply(ctx, config = {}) {
     const cfg = readConfig()
     if (cfg.mode !== 'rotate') return next()
     if (cfg.guardedProviders.length > 0 && !cfg.guardedProviders.includes(provider)) return next()
-    const ref = resolveRef(provider, cfg)
+    const ref = await resolveRef(provider, cfg)
     if (!ref) return next()
     // Only blame the key when this provider's own rotation installed it moments ago; any other auth
     // failure (a different provider, the user's own key) is not the guard's to fix.
@@ -920,7 +1026,7 @@ export function apply(ctx, config = {}) {
     const fallbackNote = fallback ? L('，回退为等待', ', falling back to waiting') : L('，交回后续处理器', ', handing back')
 
     if (cfg.mode === 'rotate') {
-      const ref = resolveRef(provider, cfg)
+      const ref = await resolveRef(provider, cfg)
       if (!credentials || !ref) {
         record('warn', {
           action: 'rotate-unavailable',
@@ -937,7 +1043,7 @@ export function apply(ctx, config = {}) {
           appendStarted(agent, { retryId: base.retryId, turn, step, retry })
           record('info', outcome.raced
             ? { action: 'rotate-raced', provider, retry, note: L('失败请求很可能还在用旧密钥，直接用新密钥重试', 'the failed request most likely still used the old key, retrying on the new one') }
-            : { action: 'rotated', provider, retry, keyRef: outcome.target, note: L(`使用 ${outcome.keyRef} 的值立即重试`, `retrying at once with the value of ${outcome.keyRef}`) })
+            : { action: 'rotated', provider, retry, keyRef: outcome.keyRef, note: L(`使用 ${outcome.keyRef} 的值立即重试`, `retrying at once with the value of ${outcome.keyRef}`) })
           return { kind: 'retry' }
         }
         record('warn', {
@@ -949,10 +1055,23 @@ export function apply(ctx, config = {}) {
         if (!fallback) return next()
         if (outcome.readyAt !== undefined) {
           // Every key is cooling: wait for the first one to come back instead of hammering the pool.
-          const untilReady = Math.max(cfg.minWaitSeconds * 1000, Math.min(outcome.readyAt - Date.now(), cfg.maxWaitSeconds * 1000))
+          // A wait capped by maxWaitSeconds may end while keys are still cooling; the post-wait check
+          // below then hands back instead of retrying a key that is known to be unusable.
+          const waitMs = outcome.readyAt - Date.now()
+          if (waitMs > cfg.maxWaitSeconds * 1000) {
+            record('warn', {
+              action: 'pool-still-cooling',
+              provider,
+              retry,
+              note: L(`最早的密钥要到 ${untilTime(outcome.readyAt)} 才恢复，超过单次等待上限 ${cfg.maxWaitSeconds}s；交回默认处理`, `the earliest key is not back until ${untilTime(outcome.readyAt)}, beyond the ${cfg.maxWaitSeconds}s per-wait cap; handing back`),
+            })
+            return next()
+          }
+          const untilReady = Math.max(cfg.minWaitSeconds * 1000, Math.min(waitMs, cfg.maxWaitSeconds * 1000))
           return waitAndRetry(payload, attempt, cfg, next, Math.round(untilReady), L('等待最早恢复的密钥', 'waiting for the first key to come back'), async () => {
             const restored = await restoreReady(cfg, ref, state, provider)
-            if (restored) record('info', { action: 'rotated', provider, retry, keyRef: ref, note: L(`等待后改用 ${restored}`, `switched to ${restored} after waiting`) })
+            if (restored.kind === 'switched') record('info', { action: 'rotated', provider, retry, keyRef: restored.ref, note: L(`等待后改用 ${restored.ref}`, `switched to ${restored.ref} after waiting`) })
+            return restored.kind !== 'none'
           })
         }
       }

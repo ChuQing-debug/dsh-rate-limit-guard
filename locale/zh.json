@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "限流守护",
-    "description": "触发提供方 PRM/TPM 限额时自动等待窗口刷新或轮换 API 密钥，并自动继续被中断的步骤。",
+    "description": "触发提供方 PRM/TPM 限额时自动等待窗口刷新，或轮换到桌面端已配置的另一个 API 密钥（可在设置页勾选轮换池），并自动继续被中断的步骤。",
     "detail": "docs/DETAIL.md"
   }
 }

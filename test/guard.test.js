@@ -3,9 +3,10 @@ import assert from 'node:assert/strict'
 import { apply } from '../index.js'
 
 /** Minimal stand-in for the DSH context: just what the guard touches. */
-function harness(config = {}, initial = {}) {
+function harness(config = {}, initial = {}, options = {}) {
   const store = new Map(Object.entries(initial))
   const failResolve = new Set()
+  const failSet = new Set()
   const events = []
   const disposers = []
   let listener
@@ -17,14 +18,22 @@ function harness(config = {}, initial = {}) {
       if (failResolve.has(ref)) throw new Error('storage busy')
       return store.has(ref) ? { value: store.get(ref) } : undefined
     },
-    async set(ref, value) { store.set(ref, value); api.onSet?.(ref, value) },
+    async set(ref, value) {
+      if (failSet.has(ref)) throw new Error('storage busy')
+      store.set(ref, value)
+      api.onSet?.(ref, value)
+    },
   }
   const sub = {
     credentials,
-    settings: { configure() {} },
+    settings: {
+      configure() {},
+      describe: () => options.namespaces ?? [],
+    },
     commands: { register(c) { command = c } },
     effect(fn) { const d = fn(); if (d) disposers.push(d) },
   }
+  if (options.directory) sub.llm = { listConfigurableProviders: () => options.directory }
   const ctx = {
     fiber: {},
     logger: { info() {}, warn() {}, error() {}, debug() {} },
@@ -53,6 +62,7 @@ function harness(config = {}, initial = {}) {
   const api = {
     store,
     failResolve,
+    failSet,
     events,
     fire,
     emitSession,
@@ -182,6 +192,85 @@ test('rotate mode hands back exhausted quota when no other key is left', async (
   const action = await h.fire({ code: 'QUOTA', message: 'quota exceeded' })
   assert.equal(action, undefined)
   assert.equal(h.nextCalls(), 1)
+})
+
+test('a pool reference owned by another provider is ignored and explained', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['OPENROUTER_API_KEY'], fallbackToWait: false, keepOriginalKey: false },
+    { DEEPSEEK_API_KEY: 'orig', OPENROUTER_API_KEY: 'or-key' },
+    {
+      directory: [
+        { provider: 'deepseek', displayName: 'DeepSeek', settingsNs: 'deepseek', settingsPath: [] },
+        { provider: 'openrouter', displayName: 'OpenRouter', settingsNs: 'pi-ai', settingsPath: ['providers', 'openrouter'] },
+      ],
+      namespaces: [
+        { ns: 'deepseek', value: { apiKeyEnv: 'DEEPSEEK_API_KEY' } },
+        { ns: 'pi-ai', value: { providers: { openrouter: { apiKeyEnv: 'OPENROUTER_API_KEY' } } } },
+      ],
+    },
+  )
+  assert.equal(await h.fire(limited()), undefined)
+  assert.equal(h.nextCalls(), 1)
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'orig')
+  assert.equal(h.store.get('OPENROUTER_API_KEY'), 'or-key')
+  const text = await h.log()
+  assert.match(text, /已忽略其他提供方的引用 OPENROUTER_API_KEY/)
+  assert.match(text, /OPENROUTER_API_KEY: 已忽略/)
+})
+
+test('a recovery beyond maxWaitSeconds hands back instead of reusing the cooling key', async () => {
+  const h = harness(
+    {
+      mode: 'rotate',
+      alternateKeyRefs: ['KEY_A'],
+      waitOnQuota: true,
+      quotaCooldownMinutes: 60,
+      maxWaitSeconds: 1,
+      maxAttempts: 10,
+    },
+    { DEEPSEEK_API_KEY: 'orig', KEY_A: 'aaa' },
+  )
+  await h.fire({ code: 'QUOTA', message: 'quota exceeded' }, { step: 1 }) // switch to KEY_A, cool the original
+  const started = Date.now()
+  assert.equal(await h.fire({ code: 'QUOTA', message: 'quota exceeded' }, { step: 1 }), undefined)
+  assert.equal(h.nextCalls(), 1)
+  assert.ok(Date.now() - started < 500, 'hands back without sleeping through the cooldown')
+  assert.match(await h.log(), /超过单次等待上限 1s/)
+})
+
+test('a capped wait that cannot restore a key hands back instead of retrying', async () => {
+  const h = harness(
+    {
+      mode: 'rotate',
+      alternateKeyRefs: ['KEY_A', 'KEY_B'],
+      keepOriginalKey: false,
+      maxAttempts: 20,
+      maxWaitSeconds: 5,
+    },
+    { DEEPSEEK_API_KEY: 'orig', KEY_A: 'aaa', KEY_B: 'bbb' },
+  )
+  await h.fire(limited('retry after 0.3s'), { step: 7 })
+  await h.fire(limited('retry after 0.3s'), { step: 7 })
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'bbb')
+  h.failSet.add('DEEPSEEK_API_KEY')
+  const started = Date.now()
+  // KEY_A and the original come off cooldown first; the current key stays cooling.
+  const action = await h.fire(limited('retry after 2s'), { step: 7 })
+  assert.equal(action, undefined)
+  assert.equal(h.nextCalls(), 1)
+  assert.ok(Date.now() - started >= 200, 'it did wait for the earliest key first')
+  assert.match(await h.log(), /等待结束仍没有可用的轮换密钥/)
+})
+
+test('the rotated log names the slot that was written, not the target', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A'], keepOriginalKey: false, fallbackToWait: false },
+    { DEEPSEEK_API_KEY: 'orig', KEY_A: 'aaa' },
+  )
+  await h.fire(limited())
+  const text = await h.log()
+  assert.match(text, /写入 KEY_A/)
+  assert.doesNotMatch(text, /写入 DEEPSEEK_API_KEY/)
 })
 
 test('concurrent failures rotate only once', async () => {
@@ -565,4 +654,68 @@ test('a finished turn resets the consecutive counter', async () => {
   h.emitSession(maxTokens(22))
   await settle()
   assert.equal(sent, 21)
+})
+
+const directoryFixture = {
+  directory: [
+    { provider: 'openrouter', settingsNs: 'pi-ai', settingsPath: ['providers', 'openrouter'] },
+    { provider: 'deepseek-account', settingsNs: 'deepseek-account', settingsPath: [] },
+    { provider: 'unconfigured', settingsNs: 'pi-ai', settingsPath: ['providers', 'unconfigured'] },
+  ],
+  namespaces: [
+    {
+      ns: 'pi-ai',
+      revision: 1,
+      value: {
+        providers: {
+          openrouter: { apiKeyEnv: 'OPENROUTER_API_KEY' },
+          unconfigured: {},
+        },
+      },
+    },
+    { ns: 'deepseek-account', revision: 1, value: {} },
+  ],
+}
+
+test('a provider without a hand mapping rotates the reference its profile declares', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A'] },
+    { OPENROUTER_API_KEY: 'openrouter-original', KEY_A: 'aaa' },
+    directoryFixture,
+  )
+  assert.deepEqual(await h.fire(limited(), { provider: 'openrouter' }), { kind: 'retry' })
+  assert.equal(h.store.get('OPENROUTER_API_KEY'), 'aaa')
+  assert.equal(h.store.get('OPENROUTER_API_KEY_RLG_ORIGINAL'), 'openrouter-original')
+  assert.equal(h.store.has('DEEPSEEK_API_KEY'), false)
+})
+
+test('an explicit provider mapping wins over the declared reference', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A'], providerRefs: ['openrouter=CUSTOM_KEY'] },
+    { CUSTOM_KEY: 'custom-original', KEY_A: 'aaa', OPENROUTER_API_KEY: 'untouched' },
+    directoryFixture,
+  )
+  assert.deepEqual(await h.fire(limited(), { provider: 'openrouter' }), { kind: 'retry' })
+  assert.equal(h.store.get('CUSTOM_KEY'), 'aaa')
+  assert.equal(h.store.get('OPENROUTER_API_KEY'), 'untouched')
+})
+
+test('an explicit "provider=-" still suppresses the declared reference', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A'], providerRefs: ['openrouter=-'] },
+    { OPENROUTER_API_KEY: 'openrouter-original', KEY_A: 'aaa' },
+    directoryFixture,
+  )
+  assert.deepEqual(await h.fire(limited('retry after 0.001s'), { provider: 'openrouter' }), { kind: 'retry' })
+  assert.equal(h.store.get('OPENROUTER_API_KEY'), 'openrouter-original')
+})
+
+test('a provider with no declared reference falls back to the default one', async () => {
+  const h = harness(
+    { mode: 'rotate', alternateKeyRefs: ['KEY_A'] },
+    { DEEPSEEK_API_KEY: 'orig', KEY_A: 'aaa' },
+    directoryFixture,
+  )
+  assert.deepEqual(await h.fire(limited(), { provider: 'unconfigured' }), { kind: 'retry' })
+  assert.equal(h.store.get('DEEPSEEK_API_KEY'), 'aaa')
 })

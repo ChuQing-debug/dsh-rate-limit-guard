@@ -42,7 +42,7 @@ DSH 派发 agent/request-error ──► 限流守护（prepend，先于默认�
 
 ```
 index.js      主机端：监听器、配置、轮换、日志、/ratelimit-log 命令
-lib.js        纯函数：报错解析、等待时长、选 Key、提供方映射
+lib.js        纯函数：报错解析、等待时长、选 Key、提供方映射与目录引用
 client.js     设置页（React，无构建步骤）
 test/         node:test 测试：主机端、纯函数、设置页
 docs/         DETAIL.md 是应用内说明；本文件是设计说明
@@ -86,7 +86,7 @@ Key 只以 SHA-256 指纹（前 16 位）的形式出现在这些状态里。
 
 ### 选哪个 Key
 
-密钥池的顺序是：`_RLG_ORIGINAL` 备份、`_RLG_PREVIOUS` 备份、然后是配置的备用引用。值相同的引用只算一次。
+密钥池的顺序是：`_RLG_ORIGINAL` 备份、`_RLG_PREVIOUS` 备份、然后是配置的轮换池引用（设置页手动填写的独立存储槽）。值相同的引用只算一次，目标引用本身不会进池。其他提供方读取的引用也不能进池：轮换会把目标的值写进槽位，若槽位同时被别的提供方读取，就会互相覆盖；这类引用会被忽略并写进 `/ratelimit-log`。
 
 `pickNext()` 从当前 Key 的下一个开始按顺序找，跳过还在冷却的。都在冷却时返回最早的恢复时间，调用方据此等待。
 
@@ -111,12 +111,21 @@ DSH 不告诉插件"这个失败的请求当时用的是哪个 Key"。几个请�
 
 ### 不轮换的提供方
 
-`refForProvider()` 决定一个提供方的失败该写哪个引用：
+`resolveRef()` 决定一个提供方的失败该写哪个引用，按顺序：
 
-- `providerRefs` 里有 `提供方=引用` → 用那个引用；
+- `providerRefs` 里有 `提供方=引用` → 用那个引用（手写优先）；
 - `提供方=-` 或 `提供方=` → 不轮换；
-- `deepseek-account` → 不轮换（内置）；
-- 其他 → 用默认的 `credentialRef`。
+- 没有手写映射时，查官方提供方目录：`llm.listConfigurableProviders()` 给出每个提供方的
+  `settingsNs` 与 `settingsPath`，`settings.describe()` 的 section 值按路径取到 profile，
+  profile 的 `apiKeyEnv` 就是这个提供方实际读取的引用；
+- `deepseek-account` → 不轮换（内置，目录里也没有 `apiKeyEnv`）；
+- 以上都没有 → 用默认的 `credentialRef`。
+
+目录结果缓存 30 秒；读取目录或设置时抛错只会打一条 warn 并退回默认引用，不影响等待逻辑。
+设置页的目标选择器用的是同一份目录，再经 `credentials.describe` 过滤掉没有值的提供方；
+轮换池则只接受手动引用。之所以不把目录里的引用放进池选择器：轮换会把目标的值写进槽位，
+而目录里每个引用都由它自己的提供方读取，写进去会串 Key。主机端会忽略这类引用，并在
+`/ratelimit-log` 里标出。
 
 不轮换的提供方按 `fallbackToWait` 走等待或交回。
 
@@ -159,12 +168,14 @@ DSH 不告诉插件"这个失败的请求当时用的是哪个 Key"。几个请�
 
 DSH 的客户端只能调用构建时就确定的主机能力（见 `@deepseek-ai/dsh-api-remotes` 的说明："Client 不会在运行时发现 Host 中已启用的服务或 Remote 定义"）。第三方插件没法给自己的设置页加一个"读取运行状态"的接口。
 
-设置页用到的都是 DSH 已有的能力：读写配置（`remote.settings`）、查看和保存凭据（`remote.credentials`）。运行状态改由 `/ratelimit-log` 命令输出。
+设置页用到的都是 DSH 已有的能力：读写配置（`remote.settings`）、查看和保存凭据（`remote.credentials`）、枚举提供方目录（`remote.llm`）。运行状态改由 `/ratelimit-log` 命令输出。
 
 ## 测试和验证
 
-- `test/guard.test.js`：用一个最小的假上下文驱动主机端，覆盖等待、轮换、并发、拒绝、备份的各种情况。
-- `test/lib.test.js`：纯函数，主要是报错解析的正反例。
-- `test/client.test.js`：用一个最小的 hooks 实现渲染设置页，检查中英文词条、校验和保存。
+- `test/guard.test.js`：用一个最小的假上下文驱动主机端，覆盖等待、轮换、并发、拒绝、备份，以及提供方目录自动解析引用。
+- `test/lib.test.js`：纯函数，主要是报错解析、映射与目录引用的正反例。
+- `test/client.test.js`：用一个最小的 hooks 实现渲染设置页，检查中英文词条、校验、保存，以及目标选择器（只列已配置、折叠展开、搜索过滤）和轮换池的手动引用列表。
+
+当前共 85 项，`npm test` 一次跑完。
 
 0.3.0 另外在真实的 DSH 0.2.2-rc.3 上验证过：`headless` 和 `web` 两个 profile，独立的 `DSH_HOME`，本地模拟的 OpenAI 兼容接口。没有覆盖的是真实服务商的报错、桌面版应用本身、多个会话真正并发。

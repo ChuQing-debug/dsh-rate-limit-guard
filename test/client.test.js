@@ -66,7 +66,7 @@ function load() {
   return module
 }
 
-function boot(settingsValue, { writable = true } = {}) {
+function boot(settingsValue, { writable = true, directory = null, namespaces = [], configured = [] } = {}) {
   const { React, render } = createReact()
   const factory = load().factory((name) => {
     assert.equal(name, 'react')
@@ -96,15 +96,26 @@ function boot(settingsValue, { writable = true } = {}) {
     },
     remote: {
       settings: {
-        describe: async () => ({ ok: true, value: { writable, namespaces: [{ ns: 'rate-limit-guard', revision: 1, value: settingsValue }] } }),
+        describe: async () => ({
+          ok: true,
+          value: {
+            writable,
+            namespaces: [{ ns: 'rate-limit-guard', revision: 1, value: settingsValue }, ...namespaces],
+          },
+        }),
         mutate: async (_ns, ops) => { mutations.push(ops); return { ok: true } },
       },
       credentials: {
-        describe: async (refs) => ({ ok: true, value: Object.fromEntries(refs.map((r) => [r, { configured: false }])) }),
+        describe: async (refs) => ({
+          ok: true,
+          value: Object.fromEntries(refs.map((ref) => [ref, { configured: configured.includes(ref) }])),
+        }),
         set: async () => ({ ok: true }),
       },
     },
   }
+  // Only hosts that expose the LLM remote can enumerate the configured keys.
+  if (directory) ctx.remote.llm = { listConfigurableProviders: async () => ({ ok: true, value: directory }) }
   factory.apply(ctx)
   return { dict, section, dock, render, mutations }
 }
@@ -163,6 +174,200 @@ test('saving accepts "provider=-" as a no-rotation mapping', async () => {
   assert.equal(b.mutations.length, 1)
   assert.ok(texts(tree).includes('INTERN_API_KEY'))
   assert.ok(!texts(tree).includes('-'))
+})
+
+function choiceInput(tree, ref, type) {
+  let found
+  walk(tree, (node) => {
+    if (found || node.type !== 'label') return
+    if (!texts(node).some((text) => text.includes(ref))) return
+    const input = (node.children ?? []).find((child) => child && child.type === 'input' && child.props.type === type)
+    if (input) found = input
+  })
+  return found
+}
+
+function textareaWithRows(tree, rows) {
+  let found
+  walk(tree, (node) => { if (!found && node.type === 'textarea' && node.props.rows === rows) found = node })
+  return found
+}
+
+function saveButtonOf(tree) {
+  let found
+  walk(tree, (node) => { if (node.type === 'button' && node.children.includes('save')) found = node })
+  return found
+}
+
+function groupToggle(tree, title) {
+  let found
+  walk(tree, (node) => {
+    if (found || node.type !== 'button') return
+    if (node.props.className !== 'rlg-group-toggle') return
+    if (texts(node).includes(title)) found = node
+  })
+  return found
+}
+
+function searchInput(tree) {
+  let found
+  walk(tree, (node) => { if (!found && node.type === 'input' && node.props.type === 'search') found = node })
+  return found
+}
+
+function groupCount(tree) {
+  let total = 0
+  walk(tree, (node) => { if (node.type === 'button' && node.props.className === 'rlg-group-toggle') total += 1 })
+  return total
+}
+
+function pickerOf(tree, index) {
+  const found = []
+  walk(tree, (node) => {
+    if (node.type !== 'div') return
+    if (!String(node.props.className ?? '').split(' ').includes('rlg-picker')) return
+    found.push(node)
+  })
+  return found[index]
+}
+
+const pickerDirectory = [
+  { provider: 'deepseek-api-key', displayName: 'DeepSeek', settingsNs: 'deepseek-api-key', settingsPath: [] },
+  { provider: 'openrouter', displayName: 'OpenRouter', settingsNs: 'pi-ai', settingsPath: ['providers', 'openrouter'] },
+  { provider: 'deepseek-account', displayName: 'Desktop account', settingsNs: 'deepseek-account', settingsPath: [] },
+]
+
+const pickerNamespaces = [
+  { ns: 'deepseek-api-key', revision: 1, value: { apiKeyEnv: 'DEEPSEEK_API_KEY' } },
+  { ns: 'pi-ai', revision: 1, value: { providers: { openrouter: { apiKeyEnv: 'OPENROUTER_API_KEY' } } } },
+  { ns: 'deepseek-account', revision: 1, value: {} },
+]
+
+test('key picker lists the references DSH has configured', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY' }, {
+    directory: pickerDirectory,
+    namespaces: pickerNamespaces,
+    configured: ['OPENROUTER_API_KEY'],
+  })
+  const tree = await b.render(b.section.Component, b.section.entry.inject())
+  const all = texts(tree)
+  const labels = all.filter((text) => text.includes('OPENROUTER_API_KEY'))
+  assert.ok(labels.length > 0, 'the OpenRouter reference is offered')
+  assert.ok(labels.some((text) => text.includes('OpenRouter')), 'the provider name is shown')
+  assert.ok(!all.some((text) => text.includes('deepseek-account')), 'account providers are not offered')
+  assert.ok(all.includes('keyConfigured'), 'the configured badge is shown')
+  assert.ok(all.includes('keyPoolTitle'), 'the rotation pool section renders')
+})
+
+test('the rotation pool is a manual list and saving writes alternateKeyRefs', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY' }, {
+    directory: pickerDirectory,
+    namespaces: pickerNamespaces,
+    configured: ['OPENROUTER_API_KEY'],
+  })
+  let tree = await b.render(b.section.Component, b.section.entry.inject())
+  assert.equal(choiceInput(tree, 'OPENROUTER_API_KEY', 'checkbox'), undefined, 'provider keys are not pool checkboxes')
+  assert.ok(texts(tree).includes('keyPoolManualHint'), 'the manual-slot explanation is shown')
+  const area = textareaWithRows(tree, 3)
+  assert.ok(area, 'the manual pool textarea is rendered')
+  area.props.onChange({ target: { value: 'KEY_A\nKEY_B' } })
+  tree = await b.render(b.section.Component, b.section.entry.inject())
+
+  await saveButtonOf(tree).props.onClick()
+  assert.equal(b.mutations.length, 1)
+  const ops = b.mutations[0]
+  assert.deepEqual([...ops.find((op) => op.path[0] === 'alternateKeyRefs').value], ['KEY_A', 'KEY_B'])
+  assert.equal(ops.find((op) => op.path[0] === 'credentialRef').value, 'DEEPSEEK_API_KEY')
+})
+
+test('choosing a key as the target removes it from the pool', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY', alternateKeyRefs: ['OPENROUTER_API_KEY'] }, {
+    directory: pickerDirectory,
+    namespaces: pickerNamespaces,
+    configured: ['OPENROUTER_API_KEY'],
+  })
+  let tree = await b.render(b.section.Component, b.section.entry.inject())
+  const radio = choiceInput(tree, 'OPENROUTER_API_KEY', 'radio')
+  assert.ok(radio, 'target radio rendered')
+  radio.props.onChange({ target: { checked: true } })
+  tree = await b.render(b.section.Component, b.section.entry.inject())
+
+  await saveButtonOf(tree).props.onClick()
+  const ops = b.mutations[0]
+  assert.equal(ops.find((op) => op.path[0] === 'credentialRef').value, 'OPENROUTER_API_KEY')
+  assert.deepEqual([...ops.find((op) => op.path[0] === 'alternateKeyRefs').value], [])
+})
+
+test('without the LLM remote the picker falls back to manual references', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY' })
+  const tree = await b.render(b.section.Component, b.section.entry.inject())
+  const all = texts(tree)
+  assert.ok(all.includes('keySourceUnavailable'))
+  assert.ok(all.some((text) => text.includes('DEEPSEEK_API_KEY')), 'the manual target still renders')
+})
+
+
+test('the picker hides providers whose key is not configured', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY' }, {
+    directory: pickerDirectory,
+    namespaces: pickerNamespaces,
+    configured: ['OPENROUTER_API_KEY'],
+  })
+  const tree = await b.render(b.section.Component, b.section.entry.inject())
+  const picker = pickerOf(tree, 0)
+  assert.equal(groupCount(picker), 1, 'only the configured provider is grouped')
+  assert.ok(groupToggle(picker, 'OpenRouter'), 'the configured provider is offered')
+  assert.ok(!groupToggle(picker, 'DeepSeek'), 'the provider without a key is hidden')
+})
+
+test('clicking a group title collapses and expands its options', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY' }, {
+    directory: pickerDirectory,
+    namespaces: pickerNamespaces,
+    configured: ['OPENROUTER_API_KEY'],
+  })
+  let tree = await b.render(b.section.Component, b.section.entry.inject())
+  assert.ok(choiceInput(pickerOf(tree, 0), 'OPENROUTER_API_KEY', 'radio'), 'open by default')
+  groupToggle(pickerOf(tree, 0), 'OpenRouter').props.onClick()
+  tree = await b.render(b.section.Component, b.section.entry.inject())
+  assert.equal(choiceInput(pickerOf(tree, 0), 'OPENROUTER_API_KEY', 'radio'), undefined, 'collapsed hides the option')
+  groupToggle(pickerOf(tree, 0), 'OpenRouter').props.onClick()
+  tree = await b.render(b.section.Component, b.section.entry.inject())
+  assert.ok(choiceInput(pickerOf(tree, 0), 'OPENROUTER_API_KEY', 'radio'), 'expands again')
+})
+
+test('search filters options and reports an empty result', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY' }, {
+    directory: pickerDirectory,
+    namespaces: pickerNamespaces,
+    configured: ['OPENROUTER_API_KEY'],
+  })
+  let tree = await b.render(b.section.Component, b.section.entry.inject())
+  searchInput(pickerOf(tree, 0)).props.onChange({ target: { value: 'zzz' } })
+  tree = await b.render(b.section.Component, b.section.entry.inject())
+  assert.equal(groupCount(pickerOf(tree, 0)), 0, 'no group matches')
+  assert.ok(texts(pickerOf(tree, 0)).includes('keyNoMatch'))
+  searchInput(pickerOf(tree, 0)).props.onChange({ target: { value: 'openrouter' } })
+  tree = await b.render(b.section.Component, b.section.entry.inject())
+  assert.ok(choiceInput(pickerOf(tree, 0), 'OPENROUTER_API_KEY', 'radio'), 'the match is shown while searching')
+})
+
+test('pool references show as tags and can be removed from the tag itself', async () => {
+  const b = boot({ mode: 'rotate', credentialRef: 'DEEPSEEK_API_KEY', alternateKeyRefs: ['OPENROUTER_API_KEY'] }, {
+    directory: pickerDirectory,
+    namespaces: pickerNamespaces,
+    configured: ['OPENROUTER_API_KEY'],
+  })
+  let tree = await b.render(b.section.Component, b.section.entry.inject())
+  let chip
+  walk(tree, (node) => {
+    if (!chip && node.type === 'button' && node.props.className === 'rlg-chip-x') chip = node
+  })
+  assert.ok(chip, 'a removable tag is rendered')
+  chip.props.onClick()
+  tree = await b.render(b.section.Component, b.section.entry.inject())
+  await saveButtonOf(tree).props.onClick()
+  assert.deepEqual([...b.mutations[0].find((op) => op.path[0] === 'alternateKeyRefs').value], [])
 })
 
 function fakeEventSource() {

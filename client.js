@@ -66,11 +66,25 @@ window.__ModuleLoader__.load({
         languageHint: '“跟随系统”按运行 DSH 的系统语言选择中文或英文。',
         languageAuto: '跟随系统',
         keysTitle: '密钥池',
-        keysDesc: '密钥值只写入凭据服务，本页保存的是引用名称。轮换会把备用密钥的值写入目标引用，下一个请求立即生效。',
+        keysDesc: '密钥值只写入凭据服务，本页保存的是引用名称。轮换会把轮换池中密钥的值写入目标引用，下一个请求立即生效。',
         credentialRef: '目标密钥引用',
-        credentialRefHint: '提供方实际读取的引用，例如 DEEPSEEK_API_KEY 或 SHUSHENG_API_KEY。',
-        alternates: '备用密钥引用',
-        alternatesHint: '每行一个。按顺序轮流使用，跳过正在冷却（刚被限流）的密钥。',
+        credentialRefHint: '提供方实际读取的引用，例如 DEEPSEEK_API_KEY 或 SHUSHENG_API_KEY。可以手动填写列表之外的引用。',
+        alternates: '轮换池引用（手动）',
+        alternatesHint: '每行一个，与上方勾选保持同步；用于模型设置里没有列出的引用。',
+        keySource: '列表只包含 DSH 里已经配置好密钥的提供方。',
+        keySourceUnavailable: '当前环境无法读取 DSH 已配置的密钥，请手动填写引用名。',
+        keySourceEmpty: '没有找到已配置的密钥。可以在“设置 → 模型”里配置一个密钥，或直接手动填写引用名。',
+        keyRefresh: '刷新列表',
+        keyRefreshing: '正在读取已配置的密钥…',
+        keyTargetTitle: '目标密钥',
+        keyTargetHint: '提供方实际读取的引用；轮换会把池中密钥的值写到这里。',
+        keyPoolTitle: '轮换池',
+        keyPoolHint: '轮换池只接受手动引用（存储槽），在下方输入框按行填写；不支持选择其他提供方的 Key。',
+        keyPoolManualHint: '轮换时会把目标引用当前的值写进池中的槽位，所以池里必须是独立的存储引用，例如 DEEPSEEK_KEY_2。其他提供方的 Key 引用由它们各自的提供方读取，填在这里会被忽略。',
+        keySelected: '已选',
+        keySearch: '搜索密钥名称或引用',
+        keyRemove: '移除',
+        keyNoMatch: '没有匹配的密钥',
         keepOriginalKey: '轮换前备份原密钥',
         keepOriginalKeyHint: '第一次换走不在池中的密钥时，把它保存到 <目标引用>_RLG_ORIGINAL，并让它参与后续轮换；之后再出现的未知密钥保存到 <目标引用>_RLG_PREVIOUS。两个备份都不会被覆盖，都占用时不再轮换、改为等待，需要你清理其中一个或把新密钥加入密钥池。',
         quotaCooldownMinutes: '额度耗尽的密钥冷却（分钟）',
@@ -148,9 +162,23 @@ window.__ModuleLoader__.load({
         keysTitle: 'Key pool',
         keysDesc: 'Key values go to the credentials service only; this page stores reference names. Rotation writes a pool value into the target reference and the next request uses it.',
         credentialRef: 'Target credential reference',
-        credentialRefHint: 'The reference the provider actually reads, e.g. DEEPSEEK_API_KEY or SHUSHENG_API_KEY.',
-        alternates: 'Pool references',
-        alternatesHint: 'One per line. Keys are used in turn; keys still cooling down after a limit are skipped.',
+        credentialRefHint: 'The reference the provider actually reads, e.g. DEEPSEEK_API_KEY or SHUSHENG_API_KEY. You can also type a reference the list does not show.',
+        alternates: 'Pool references (manual)',
+        alternatesHint: 'One per line; kept in sync with the checkboxes above, for references the Models settings do not list.',
+        keySource: 'Only providers whose key is already configured in DSH are listed.',
+        keySourceUnavailable: 'This environment cannot read the keys configured in DSH; enter reference names manually.',
+        keySourceEmpty: 'No configured key was found. Add one in Settings → Models, or type a reference below.',
+        keyRefresh: 'Refresh list',
+        keyRefreshing: 'Reading the configured keys…',
+        keyTargetTitle: 'Target key',
+        keyTargetHint: 'The reference the provider actually reads; rotation writes pool values here.',
+        keyPoolTitle: 'Rotation pool',
+        keyPoolHint: 'The pool only accepts manual references (storage slots), entered below; another provider\'s key cannot be selected here.',
+        keyPoolManualHint: 'Rotation copies the target reference\'s current value into a pool slot, so every pool entry must be an independent storage reference such as DEEPSEEK_KEY_2. Another provider\'s key reference is read by that provider and is ignored here.',
+        keySelected: 'Selected',
+        keySearch: 'Search key name or reference',
+        keyRemove: 'Remove',
+        keyNoMatch: 'No key matches the search',
         keepOriginalKey: 'Back up the original key before rotating',
         keepOriginalKeyHint: 'The first time a key outside the pool is rotated away, it is saved to <target>_RLG_ORIGINAL and joins the rotation; a later unknown key goes to <target>_RLG_PREVIOUS. Neither backup is ever overwritten: when both are taken the guard stops rotating and waits, until you clear one or add the new key to the pool.',
         quotaCooldownMinutes: 'Cooldown for exhausted keys (minutes)',
@@ -218,6 +246,34 @@ window.__ModuleLoader__.load({
 .rlg-masked { color: var(--dsw-alias-label-tertiary); font-size: 11px; }
 .rlg-key-form { display: flex; flex-wrap: wrap; gap: 8px; }
 .rlg-key-form .rlg-input { flex: 1 1 220px; }
+.rlg-subsection { display: flex; flex-direction: column; gap: 9px; padding-top: 13px; border-top: 1px dashed var(--dsw-alias-border-l1); }
+.rlg-subtitle { font-size: 12.5px; font-weight: 600; }
+.rlg-picker { display: flex; flex-direction: column; gap: 8px; }
+.rlg-picker-search { width: 100%; }
+.rlg-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.rlg-chips-label { font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
+.rlg-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 8px; border: 1px solid var(--dsw-alias-brand-primary); border-radius: 999px; background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent); font-size: 11.5px; }
+.rlg-chip-name { min-width: 0; overflow-wrap: anywhere; }
+.rlg-chip-x { border: none; background: transparent; color: var(--dsw-alias-label-secondary); font-size: 13px; line-height: 1; padding: 0 1px; cursor: pointer; }
+.rlg-chip-x:hover { color: var(--dsw-alias-state-error-primary); }
+.rlg-groups { display: flex; flex-direction: column; gap: 6px; }
+.rlg-group { border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; background: var(--dsw-alias-bg-layer-2); overflow: hidden; }
+.rlg-group-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; }
+.rlg-group-toggle { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; padding: 0; border: none; background: transparent; color: var(--dsw-alias-label-primary); font-size: 12.5px; font-weight: 600; text-align: left; cursor: pointer; }
+.rlg-group-caret { width: 12px; color: var(--dsw-alias-label-secondary); }
+.rlg-group-name { min-width: 0; overflow-wrap: anywhere; }
+.rlg-group-count { margin-left: 2px; color: var(--dsw-alias-label-secondary); font-weight: 400; font-size: 11.5px; }
+.rlg-group-actions { display: flex; align-items: center; gap: 8px; }
+.rlg-link { border: none; background: transparent; color: var(--dsw-alias-brand-primary); font-size: 11.5px; padding: 0; cursor: pointer; }
+.rlg-link:disabled { color: var(--dsw-alias-label-secondary); opacity: .6; cursor: default; }
+.rlg-group-body { display: flex; flex-direction: column; border-top: 1px solid var(--dsw-alias-border-l1); }
+.rlg-option { display: flex; align-items: center; gap: 9px; padding: 7px 12px; cursor: pointer; transition: background .15s; }
+.rlg-option:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.rlg-option.is-active { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent); }
+.rlg-option.is-disabled { cursor: default; opacity: .62; }
+.rlg-option input { width: 14px; height: 14px; margin: 0; accent-color: var(--dsw-alias-brand-primary); cursor: pointer; }
+.rlg-option-name { min-width: 0; overflow-wrap: anywhere; font-size: 12.5px; }
+.rlg-option-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-left: auto; }
 .rlg-button { display: inline-flex; align-items: center; justify-content: center; height: 30px; padding: 0 13px; border: 1px solid transparent; border-radius: 9px; font-size: 12.5px; cursor: pointer; transition: background .15s, border-color .15s, opacity .15s; }
 .rlg-button:disabled { cursor: default; opacity: .55; }
 .rlg-button-primary { background: var(--dsw-alias-brand-primary); color: #fff; }
@@ -294,6 +350,77 @@ window.__ModuleLoader__.load({
       return out
     }
 
+    /** Read a nested value along a settings schema path (the path is an array of keys). */
+    function getPath(value, path) {
+      let node = value
+      for (const segment of Array.isArray(path) ? path : []) {
+        if (node === null || typeof node !== 'object') return undefined
+        node = node[segment]
+      }
+      return node
+    }
+
+    /** The reference DSH would read for a provider that declares no `apiKeyEnv` of its own. */
+    function derivedKeyRef(provider) {
+      return `${String(provider).toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`
+    }
+
+    /**
+     * Turn the provider directory plus the described settings into the list of credential
+     * references DSH itself knows about. This mirrors the official Models settings page: each
+     * configurable provider contributes the `apiKeyEnv` its profile declares, falling back to the
+     * derived reference. Account-backed providers carry no raw key, so they are skipped.
+     */
+    function directoryRows(directory, namespaces) {
+      const rows = []
+      const seen = new Set()
+      for (const entry of Array.isArray(directory) ? directory : []) {
+        if (!entry || typeof entry.provider !== 'string' || entry.provider === 'deepseek-account') continue
+        const profile = getPath(namespaces.get(entry.settingsNs)?.value, entry.settingsPath)
+        const declared = typeof profile?.apiKeyEnv === 'string' ? profile.apiKeyEnv.trim() : ''
+        const ref = declared !== '' ? declared : derivedKeyRef(entry.provider)
+        if (!REF_PATTERN.test(ref) || seen.has(ref)) continue
+        seen.add(ref)
+        rows.push({
+          ref,
+          label: typeof entry.displayName === 'string' && entry.displayName !== '' ? entry.displayName : entry.provider,
+          provider: entry.provider,
+          derived: declared === '',
+        })
+      }
+      return rows
+    }
+
+    /** "DeepSeek · DEEPSEEK_API_KEY" when the provider name differs from the reference. */
+    function chipLabel(row, ref) {
+      if (!row) return ref
+      const label = typeof row.label === 'string' ? row.label : ''
+      return label !== '' && label !== ref ? `${label} · ${ref}` : ref
+    }
+
+    /** Group the discovered rows by provider; a search term keeps only the matching groups. */
+    function keyGroups(rows, query) {
+      const needle = String(query ?? '').trim().toLowerCase()
+      const map = new Map()
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (!row || !REF_PATTERN.test(String(row.ref ?? ''))) continue
+        const key = typeof row.provider === 'string' && row.provider !== '' ? row.provider : row.ref
+        const group = map.get(key) ?? { key, title: row.label || row.provider || row.ref, rows: [] }
+        group.rows.push(row)
+        map.set(key, group)
+      }
+      const groups = []
+      for (const group of map.values()) {
+        const matched = needle === ''
+          ? group.rows
+          : group.rows.filter((row) => `${group.title} ${row.label ?? ''} ${row.ref}`.toLowerCase().includes(needle))
+        if (matched.length === 0) continue
+        groups.push({ key: group.key, title: group.title, rows: matched })
+      }
+      groups.sort((left, right) => String(left.title).localeCompare(String(right.title)))
+      return groups
+    }
+
     function draftFrom(value) {
       const v = value ?? {}
       return {
@@ -338,7 +465,12 @@ window.__ModuleLoader__.load({
         { op: 'set', path: ['maxTotalWaitMinutes'], value: numberOr(draft.maxTotalWaitMinutes, 60, 0, 10080) },
         { op: 'set', path: ['language'], value: draft.language },
         { op: 'set', path: ['credentialRef'], value: String(draft.credentialRef ?? '').trim() || 'DEEPSEEK_API_KEY' },
-        { op: 'set', path: ['alternateKeyRefs'], value: splitList(draft.alternateKeyRefs) },
+        {
+          op: 'set',
+          path: ['alternateKeyRefs'],
+          // A key cannot rotate into itself, so the target is never part of the pool.
+          value: splitList(draft.alternateKeyRefs).filter((ref) => ref !== String(draft.credentialRef ?? '').trim()),
+        },
         { op: 'set', path: ['providerRefs'], value: splitList(draft.providerRefs) },
         { op: 'set', path: ['fallbackToWait'], value: draft.fallbackToWait === true },
         { op: 'set', path: ['jitter'], value: draft.jitter === true },
@@ -351,6 +483,9 @@ window.__ModuleLoader__.load({
       ]
     }
 
+    /** One `credentials.describe` call carries at most this many references. */
+    const MAX_DESCRIBE_REFS = 64
+
     function createApi(ctx) {
       const read = async () => {
         const response = await ctx.remote.settings.describe()
@@ -358,8 +493,40 @@ window.__ModuleLoader__.load({
         const view = response.value.namespaces.find((candidate) => candidate.ns === SETTINGS_NS)
         return { view, writable: response.value.writable }
       }
+      const describeCredentials = async (refs) => {
+        const unique = [...new Set(Array.isArray(refs) ? refs : [])].filter((ref) => typeof ref === 'string').slice(0, MAX_DESCRIBE_REFS)
+        if (unique.length === 0) return {}
+        const response = await ctx.remote.credentials.describe(unique)
+        return response.ok ? response.value : {}
+      }
+      /**
+       * Enumerate the keys DSH has configured, through the official remote seams only:
+       * `llm.listConfigurableProviders()` for the provider directory, `settings.describe()` for the
+       * `apiKeyEnv` each provider profile declares, and `credentials.describe()` for the
+       * configured/masked state. A host without `remote.llm` degrades to manual entry.
+       */
+      const discoverKeys = async () => {
+        const llm = ctx.remote?.llm
+        if (!llm || typeof llm.listConfigurableProviders !== 'function') {
+          return { ok: false, error: 'llm-remote-unavailable', rows: [], credentials: {} }
+        }
+        const [directory, settings] = await Promise.all([llm.listConfigurableProviders(), ctx.remote.settings.describe()])
+        if (!directory.ok) return { ok: false, error: directory.error?.message ?? 'llm/directory-failed', rows: [], credentials: {} }
+        if (!settings.ok) return { ok: false, error: settings.error?.message ?? 'settings/read-failed', rows: [], credentials: {} }
+        const namespaces = new Map((settings.value.namespaces ?? []).map((view) => [view.ns, view]))
+        const rows = directoryRows(directory.value, namespaces)
+        const credentials = {}
+        for (let index = 0; index < rows.length; index += MAX_DESCRIBE_REFS) {
+          const batch = rows.slice(index, index + MAX_DESCRIBE_REFS).map((row) => row.ref)
+          Object.assign(credentials, await describeCredentials(batch))
+        }
+        // Only providers that really hold a key are offered: an empty slot cannot rotate anything.
+        const usable = rows.filter((row) => credentials[row.ref]?.configured === true)
+        return { ok: true, error: null, rows: usable, credentials }
+      }
       return {
         read,
+        discoverKeys,
         async write(ops) {
           let lastError = null
           for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -374,12 +541,7 @@ window.__ModuleLoader__.load({
           }
           return { ok: false, error: lastError?.message ?? 'settings/conflict' }
         },
-        async describeCredentials(refs) {
-          const unique = [...new Set(refs)].slice(0, 64)
-          if (unique.length === 0) return {}
-          const response = await ctx.remote.credentials.describe(unique)
-          return response.ok ? response.value : {}
-        },
+        describeCredentials,
         async setCredential(ref, value) {
           const response = await ctx.remote.credentials.set(ref, value)
           return response.ok ? { ok: true } : { ok: false, error: response.error?.message ?? 'credentials/rejected' }
@@ -407,6 +569,72 @@ window.__ModuleLoader__.load({
       return h('label', { className: 'rlg-check' },
         h('input', { type: 'checkbox', checked, disabled, onChange: (event) => onChange(event.target.checked) }),
         h('span', null, label))
+    }
+
+    /**
+     * Inline, collapsible target picker: one collapsible group per provider, the selection shown as a
+     * tag, and a search box that filters the groups. There is deliberately no multi-select mode: the
+     * rotation pool is a list of independent storage references, because rotation writes the target's
+     * key into a pool slot. Another provider's reference belongs to that provider and cannot be a slot,
+     * which is why the old pool picker was misleading and has been replaced by the manual list below.
+     */
+    function KeyPicker({ rows, selected, credentials, loading, disabled, t, onChange }) {
+      const [open, setOpen] = React.useState({})
+      const [query, setQuery] = React.useState('')
+      const chosen = typeof selected === 'string' && selected !== '' ? [selected] : []
+      const searching = query.trim() !== ''
+      const groups = keyGroups(rows, query)
+      const byRef = new Map((Array.isArray(rows) ? rows : []).map((row) => [row.ref, row]))
+      const isOpen = (group) => open[group.key] ?? true
+      const toggleGroup = (group) => setOpen((current) => ({ ...current, [group.key]: !isOpen(group) }))
+
+      return h('div', { className: 'rlg-picker' },
+        h('input', {
+          className: 'rlg-input rlg-picker-search',
+          type: 'search',
+          spellCheck: false,
+          placeholder: t('keySearch'),
+          value: query,
+          disabled,
+          onChange: (event) => setQuery(event.target.value),
+        }),
+        chosen.length > 0 ? h('div', { className: 'rlg-chips' },
+          h('span', { className: 'rlg-chips-label' }, t('keySelected')),
+          chosen.map((ref) => h('span', { key: ref, className: 'rlg-chip', title: ref },
+            h('span', { className: 'rlg-chip-name' }, chipLabel(byRef.get(ref), ref))))) : null,
+        groups.length === 0
+          ? h('div', { className: 'rlg-hint' }, loading ? t('keyRefreshing') : searching ? t('keyNoMatch') : t('keySourceEmpty'))
+          : h('div', { className: 'rlg-groups' }, groups.map((group) => {
+            const expanded = isOpen(group)
+            const picked = group.rows.filter((row) => chosen.includes(row.ref))
+            return h('div', { key: group.key, className: 'rlg-group' },
+              h('div', { className: 'rlg-group-head' },
+                h('button', {
+                  className: 'rlg-group-toggle',
+                  type: 'button',
+                  'aria-expanded': expanded,
+                  onClick: () => toggleGroup(group),
+                },
+                  h('span', { className: 'rlg-group-caret' }, expanded ? '\u25be' : '\u25b8'),
+                  h('span', { className: 'rlg-group-name' }, group.title),
+                  h('span', { className: 'rlg-group-count' }, `${picked.length}/${group.rows.length}`))),
+              expanded ? h('div', { className: 'rlg-group-body' }, group.rows.map((row) => {
+                const info = credentials?.[row.ref]
+                const active = chosen.includes(row.ref)
+                return h('label', { key: row.ref, className: `rlg-option ${active ? 'is-active' : ''} ${disabled ? 'is-disabled' : ''}` },
+                  h('input', {
+                    type: 'radio',
+                    name: 'rlg-target-ref',
+                    checked: active,
+                    disabled,
+                    onChange: () => onChange(row.ref),
+                  }),
+                  h('span', { className: 'rlg-option-name' }, chipLabel(row, row.ref)),
+                  h('span', { className: 'rlg-option-meta' },
+                    info?.masked ? h('span', { className: 'rlg-masked' }, info.masked) : null,
+                    info?.configured === true ? h('span', { className: 'rlg-badge is-ok' }, t('keyConfigured')) : null))
+              })) : null)
+          })))
     }
 
     function CredentialRow({ reference, info, t, draftValue, onChange, onSave, busy, disabled }) {
@@ -509,9 +737,25 @@ window.__ModuleLoader__.load({
       const [keyDraft, setKeyDraft] = React.useState({})
       const [busyKey, setBusyKey] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
+      /** key references DSH has configured, discovered through the official remote seams */
+      const [keys, setKeys] = React.useState({ status: 'loading', rows: [], error: null })
+
+      const discover = React.useCallback(async () => {
+        try {
+          const found = await api.discoverKeys()
+          if (found?.ok === true) {
+            return { status: 'ready', rows: found.rows ?? [], error: null, credentials: found.credentials ?? {} }
+          }
+          return { status: 'error', rows: [], error: found?.error ?? 'llm-remote-unavailable', credentials: {} }
+        } catch (error) {
+          return { status: 'error', rows: [], error: String(error?.message ?? error), credentials: {} }
+        }
+      }, [api])
 
       const load = React.useCallback(async () => {
         setState({ status: 'loading' })
+        setKeys((current) => ({ ...current, status: 'loading' }))
+        const discovery = discover()
         try {
           const result = await api.read()
           if (!result.view) {
@@ -521,12 +765,15 @@ window.__ModuleLoader__.load({
           const nextDraft = draftFrom(result.view.value)
           setDraft(nextDraft)
           setState({ status: 'ready', view: result.view, writable: result.writable })
+          const found = await discovery
+          setKeys({ status: found.status, rows: found.rows, error: found.error })
           const refs = refsOf(nextDraft)
-          if (refs.length > 0) setCredentials(await api.describeCredentials(refs))
+          const described = refs.length > 0 ? await api.describeCredentials(refs) : {}
+          setCredentials({ ...found.credentials, ...described })
         } catch (error) {
           setState({ status: 'error', message: String(error?.message ?? error) })
         }
-      }, [api])
+      }, [api, discover])
 
       React.useEffect(() => {
         load()
@@ -553,6 +800,21 @@ window.__ModuleLoader__.load({
       const refs = refsOf(draft)
       const mode = draft.mode
       const update = (patch) => setDraft((current) => ({ ...current, ...patch }))
+      const targetRef = String(draft.credentialRef ?? '').trim()
+      const poolRefs = splitList(draft.alternateKeyRefs)
+
+      /** Make `ref` the target and drop it from the pool: a key cannot rotate into itself. */
+      const chooseTarget = (ref) => update({
+        credentialRef: ref,
+        alternateKeyRefs: poolRefs.filter((candidate) => candidate !== ref).join('\n'),
+      })
+
+      const refreshKeys = async () => {
+        setKeys((current) => ({ ...current, status: 'loading' }))
+        const found = await discover()
+        setKeys({ status: found.status, rows: found.rows, error: found.error })
+        if (found.status === 'ready') setCredentials((current) => ({ ...current, ...found.credentials }))
+      }
 
       const save = async () => {
         if (!writable) return
@@ -678,24 +940,61 @@ window.__ModuleLoader__.load({
             }))),
 
         h(Card, { title: t('keysTitle'), desc: t('keysDesc') },
-          h(Row, { label: t('credentialRef'), hint: t('credentialRefHint') },
-            h('input', {
-              className: 'rlg-input',
-              type: 'text',
-              spellCheck: false,
-              value: draft.credentialRef,
+          h('div', { className: 'rlg-subsection' },
+            h(Row, {
+              label: keys.status === 'error'
+                ? t('keySourceUnavailable')
+                : keys.status === 'loading' ? t('keyRefreshing') : t('keySource'),
+            },
+              h('button', {
+                className: 'rlg-button rlg-button-secondary',
+                type: 'button',
+                disabled: keys.status === 'loading' || busy,
+                onClick: refreshKeys,
+              }, t('keyRefresh'))),
+            h('div', { className: 'rlg-subtitle' }, t('keyTargetTitle')),
+            h('div', { className: 'rlg-hint' }, t('keyTargetHint')),
+            h(KeyPicker, {
+              rows: keys.rows,
+              selected: targetRef,
+              credentials,
+              loading: keys.status === 'loading',
               disabled: !writable,
-              onChange: (event) => update({ credentialRef: event.target.value }),
-            })),
-          h(Row, { label: t('alternates'), hint: t('alternatesHint') },
-            h('textarea', {
-              className: 'rlg-textarea',
-              rows: 3,
-              spellCheck: false,
-              value: draft.alternateKeyRefs,
-              disabled: !writable,
-              onChange: (event) => update({ alternateKeyRefs: event.target.value }),
-            })),
+              t,
+              onChange: (ref) => chooseTarget(ref),
+            }),
+            h(Row, { label: t('credentialRef'), hint: t('credentialRefHint') },
+              h('input', {
+                className: 'rlg-input',
+                type: 'text',
+                spellCheck: false,
+                value: draft.credentialRef,
+                disabled: !writable,
+                onChange: (event) => update({ credentialRef: event.target.value }),
+              })),
+            h('div', { className: 'rlg-subtitle' }, t('keyPoolTitle')),
+            h('div', { className: 'rlg-hint' }, t('keyPoolHint')),
+            h('div', { className: 'rlg-hint' }, t('keyPoolManualHint')),
+            poolRefs.length > 0 ? h('div', { className: 'rlg-chips' },
+              h('span', { className: 'rlg-chips-label' }, t('keySelected')),
+              poolRefs.map((ref) => h('span', { key: ref, className: 'rlg-chip', title: ref },
+                h('span', { className: 'rlg-chip-name' }, ref),
+                h('button', {
+                  className: 'rlg-chip-x',
+                  type: 'button',
+                  disabled: !writable,
+                  'aria-label': `${t('keyRemove')} ${ref}`,
+                  onClick: () => update({ alternateKeyRefs: poolRefs.filter((candidate) => candidate !== ref).join('\n') }),
+                }, '×')))) : null,
+            h(Row, { label: t('alternates'), hint: t('alternatesHint') },
+              h('textarea', {
+                className: 'rlg-textarea',
+                rows: 3,
+                spellCheck: false,
+                value: draft.alternateKeyRefs,
+                disabled: !writable,
+                onChange: (event) => update({ alternateKeyRefs: event.target.value }),
+              }))),
           h(Row, { label: t('providerRefs'), hint: t('providerRefsHint') },
             h('textarea', {
               className: 'rlg-textarea',
@@ -774,7 +1073,7 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale', 'remote', 'remote.settings', 'remote.credentials'],
+      inject: ['slots', 'locale', 'remote', 'remote.settings', 'remote.credentials', 'remote.llm'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, DICT), 'rate-limit-guard: locale')
         const t = ctx.locale.bind(NS)

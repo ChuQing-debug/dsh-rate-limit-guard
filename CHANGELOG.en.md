@@ -2,6 +2,92 @@
 
 [中文版](CHANGELOG.md)
 
+## Unreleased
+
+### Fixed
+
+- **The rotation pool only accepts manual references.** The old multi-select picker listed other
+  providers' key references, which the host deliberately ignores so that two providers cannot
+  overwrite the same credential, so ticking a key looked like it worked but never rotated. The
+  picker now only chooses the **target**; the pool is a manual list of independent storage
+  references (such as `DEEPSEEK_KEY_2`). A provider-owned reference typed into the pool is ignored,
+  and `/ratelimit-log` explains why.
+- **A cooling-pool wait no longer retries a key that is still cooling.** When the earliest recovery
+  is later than `maxWaitSeconds`, the failure goes back to DSH immediately; if a completed wait still
+  has no usable key, it also hands back instead of retrying unconditionally.
+- The rotation log's `keyRef` now records the pool slot that was actually written, not the target.
+
+### Tests
+
+- 85 tests. Added regressions for ignored provider references, recovery beyond the single-wait cap,
+  a wait that still has no usable key, and the rotation log field; the client selector tests now
+  cover the manual pool list.
+
+## 0.5.0
+
+### Added
+
+- **The key selector is now collapsible and grouped.** Both key lists in the rotation card became
+  one grouped selector: providers are the groups, a click on a group title expands or collapses it,
+  and clicking options in multi-select adds them to the rotation pool.
+  - Selected keys are shown as tags at the top; the × on a tag removes just that key.
+  - Every group has **Select group** and **Clear group**.
+  - The search box filters by provider or reference name and opens the matching groups; with no
+    match it reports "No key matches the search".
+  - Options can be disabled: the current target key is shown in the pool as a disabled option.
+  - The selector is an inline area of the page, so clicking outside it closes nothing.
+
+### Changed
+
+- **Only providers that really hold a key are listed.** The directory still comes from the official
+  `llm.listConfigurableProviders` + `settings.describe` seams, but entries whose reference is not
+  configured according to `credentials.describe` are filtered out; an empty result shows an empty
+  state instead.
+
+### Tests
+
+- Six new selector cases (configured only, collapse/expand, search, select-all/clear, tag removal,
+  disabled target), 83 tests in total.
+
+## 0.4.0
+
+### Added
+
+- **Pick the rotation keys in the settings page.** The rotation card now reads the keys already
+  configured on the desktop. References come from DSH's official provider directory
+  (`llm.listConfigurableProviders`) and settings forms (`credentials.describe`), and each row
+  shows the provider name, the reference name and a configured / not configured badge.
+  - **Target key** is a radio list: pick a configured key and it becomes the reference the
+    provider resolves and rotation writes into.
+  - **Rotation pool** is a checkbox list: tick a key to add it, untick to remove it. The target
+    key never appears in the pool, and ticking it cannot add it either.
+  - **Refresh** re-reads the directory and the credential states, so adding a provider or
+    changing a key does not require reopening the settings page.
+  - The manual inputs stay below the lists: a reference the desktop does not expose (a
+    hand-made `DEEPSEEK_KEY_2`, say) can still be typed, and manual text wins.
+- **The host side now resolves the reference each provider reads.** For a provider without a
+  hand-written mapping, the plugin uses that provider's `apiKeyEnv` from the official directory
+  as the rotation target; an explicit `providerRefs` entry still wins, and `provider=-` still
+  means “never rotate this provider”. The directory is cached for 30 seconds and failures fall
+  back to the previous default reference.
+
+### Changed
+
+- Rotation-pool references are deduplicated and the target reference is dropped from the pool,
+  so a stale entry in the profile can no longer turn the target key into a pool key.
+- The `/ratelimit-log` mode line now says “N reference(s) in the pool”.
+
+### Fixed
+
+- Saving the settings page no longer writes the target reference into the rotation pool twice.
+
+### Tests
+
+- 77 tests: the key picker (enumeration, ticking writes the pool, choosing a target, fallback
+  without the LLM service), host-side directory resolution (auto-detected reference, explicit
+  mapping wins, `provider=-`, fallback when nothing is declared), and the `hasMapping` /
+  `declaredKeyRef` helpers.
+
 ## 0.3.1
 
 ### Added
